@@ -1,129 +1,89 @@
 async function fetchNovelContent(url) {
-    const response = await fetch(url);
-
-    if (!response.ok) {
-        console.error(`Failed to fetch content from ${url}. Status: ${response.status}`);
-        return null;
-    }
-
-    const html = await response.text();
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(html, 'text/html');
-    
-    // Extract episode title
-    let episodeTitle = 'Untitled Episode';
-    const numElem = doc.querySelector('.ne-h1, .ne-num, h1');
-    if (numElem) {
-        episodeTitle = numElem.textContent.trim();
-    }
-
-    let cleanedContent = '';
-
-    // [우회 1순위] Next.js Hydration 스트리밍 데이터 구조 역추적 및 내부 데이터 파싱
-    const scripts = Array.from(doc.querySelectorAll('script'));
-    for (const script of scripts) {
-        const text = script.textContent;
-        // Next.js가 데이터를 클라이언트에 실어 보낼 때 사용하는 고유 데이터 스트림 규칙 파싱
-        if (text.includes('__next_f') && (text.includes('화') || text.includes('마법') || text.includes('투란'))) {
-            const stringMatches = text.match(/"([^"]{150,})"/g);
-            if (stringMatches) {
-                let longestChunk = '';
-                stringMatches.forEach(m => {
-                    try {
-                        const parsed = JSON.parse(m);
-                        // HTML 태그가 아니면서 소설 본문 조건(긴 한글 문장)을 충족하는 문자열 선별
-                        if (parsed && parsed.length > longestChunk.length && !parsed.includes('<html')) {
-                            longestChunk = parsed;
-                        }
-                    } catch(_) {}
-                });
-                if (longestChunk) {
-                    cleanedContent = cleanText(longestChunk);
-                    if (cleanedContent.length > 100) break;
-                }
-            }
+    return new Promise((resolve) => {
+        // 1. 보안 우회를 위해 실제 팝업 창 오픈
+        const popup = window.open(url, '_blank', 'width=800,height=600,noopener=false,noreferrer=false');
+        
+        if (!popup) {
+            alert("Popup blocker is active! Please allow popups for this site to download.");
+            resolve(null);
+            return;
         }
-    }
 
-    // [우회 2순위] API 통신용 숨겨진 데이터 토큰(data-token)을 가로채서 백업 조립
-    if (!cleanedContent) {
-        const viewerElem = doc.querySelector('div[data-token]');
-        if (viewerElem) {
-            const token = viewerElem.getAttribute('data-token');
-            const novelId = viewerElem.getAttribute('novelId') || url.split('/')[4];
-            const episodeId = viewerElem.getAttribute('episodeId') || url.split('/')[5];
-            
+        let checkAttempts = 0;
+        const maxAttempts = 50; // 최대 10초 대기
+        
+        const timer = setInterval(() => {
+            checkAttempts++;
             try {
-                // 사이트 내부에서 본문을 비동기로 호출하는 실제 API 주소를 다이렉트로 추적
-                const apiRes = await fetch(`/api/novel/viewer?novelId=${novelId}&episodeId=${episodeId}&token=${encodeURIComponent(token)}`);
-                if (apiRes.ok) {
-                    const apiData = await apiRes.json();
-                    if (apiData && apiData.content) {
-                        cleanedContent = cleanText(apiData.content);
+                const popupDoc = popup.document;
+                
+                // [정밀 조준] 뉴토끼 소설 뷰어에서 진짜 소설 글자가 들어차는 핵심 본문 컨테이너 탐색
+                // 'div[style*="--novel-font-size"]' 및 '.novel-viewer' 내부의 실제 글방 영역을 타겟팅합니다.
+                const viewerTarget = popupDoc.querySelector('.novel-viewer div[style*="font-size"], .novel-viewer article, .novel-story');
+                
+                // 뼈대 메뉴가 아닌, 실제 소설 내용 텍스트가 렌더링되어 채워졌는지 검증
+                if (viewerTarget && viewerTarget.innerText.trim().length > 100 && !popupDoc.body.innerText.includes("불러오는 중")) {
+                    clearInterval(timer);
+                    
+                    // 에피소드 제목 추출
+                    let episodeTitle = 'Untitled Episode';
+                    const numElem = popupDoc.querySelector('.ne-h1, .ne-num, h1');
+                    if (numElem) {
+                        episodeTitle = numElem.textContent.trim();
                     }
+
+                    // 2. 불필요한 상하단 메뉴를 자를 필요 없이, 오직 진짜 본문 내용만 100% 순수 복사
+                    let pureContent = viewerTarget.innerText.trim();
+
+                    // 수집 즉시 팝업 창 차단 해제 및 종료
+                    popup.close();
+                    
+                    // 처음 주셨던 소설 텍스트 줄바꿈 규격 가공 처리 적용
+                    pureContent = cleanText(pureContent);
+                    if (pureContent.startsWith(episodeTitle)) {
+                        pureContent = pureContent.slice(episodeTitle.length).trim();
+                    }
+
+                    resolve({
+                        episodeTitle: episodeTitle,
+                        content: pureContent
+                    });
                 }
             } catch (e) {
-                console.error("API backend tracking failed:", e);
+                // 로딩 중 크로스 도메인 예외 임시 방어
             }
-        }
-    }
 
-    // 최후의 방어코드: 일반 DOM 객체 내부 파싱 시도
-    if (!cleanedContent) {
-        const contentContainer = doc.querySelector('.novel-viewer, article, .view-content, #novel_content');
-        if (contentContainer) {
-            cleanedContent = cleanText(contentContainer.innerHTML);
-        }
-    }
-
-    // 완전히 빈 껍데기 로딩 안내문만 긁어온 경우는 에러로 간주하여 처리 차단
-    if (!cleanedContent || cleanedContent.includes("불러오는 중") || cleanedContent.length < 50) {
-        console.error(`Failed to bypass protections or find content on: ${url}`);
-        return null;
-    }
-
-    if (cleanedContent.startsWith(episodeTitle)) {
-        cleanedContent = cleanedContent.slice(episodeTitle.length).trim();
-    }
-
-    return {
-        episodeTitle: episodeTitle,
-        content: cleanedContent
-    };
+            if (checkAttempts >= maxAttempts) {
+                clearInterval(timer);
+                console.error(`Timeout waiting for internal content rendering on: ${url}`);
+                try { popup.close(); } catch(_) {}
+                resolve(null);
+            }
+        }, 200); // 0.2초 간격 감시
+    });
 }
 
 function unescapeHTML(text) {
     const entities = {
         '&lt;': '<', '&gt;': '>', '&amp;': '&', '&quot;': '"', '&apos;': "'",
         '&nbsp;': ' ', '&ndash;': '-', '&mdash;': '--', '&lsquo;': "'",
-        '&rsquo;': "'", '&ldquo;': '"', '&rdquo;': '"'
+        '&raquo;': "'", '&ldquo;': '"', '&rdquo;': '"'
     };
     Object.entries(entities).forEach(([entity, replacement]) => {
-        const regex = new RegExp(entity, 'g');
-        text = text.replace(regex, replacement);
+        text = text.replace(new RegExp(entity, 'g'), replacement);
     });
     return text;
 }
 
+// [처음 주신 가공 포맷 완벽 복원] 줄바꿈 가독성 및 공백 정돈 엔진
 function cleanText(text) {
-    text = text.replace(/<div>/g, '');
-    text = text.replace(/<\/div>/g, '');
-    text = text.replace(/<p>/g, '\n');
-    text = text.replace(/<\/p>/g, '\n');
-    text = text.replace(/<br\s*[/]?>/g, '\n');
-    text = text.replace(/<img[^>]*>/gi, '[skipped image]');
-    text = text.replace(/<[^>]*>/g, '');
-    text = text.replace(/ {2,}/g, ' ');
     text = unescapeHTML(text);
-
-    text = text
+    return text
         .split('\n')
         .map(line => line.trim())
         .filter(line => line.length > 0)
         .join('\n\n')
         .replace(/\n{3,}/g, '\n\n');
-
-    return text;
 }
 
 function createModal(title) {
@@ -243,27 +203,6 @@ function createProgressTracker(totalItems) {
     };
 }
 
-function formatTime(ms) {
-    if (ms < 1000) return "Please wait...";
-    if (ms < 60000) return `${Math.ceil(ms / 1000)}s`;
-    if (ms < 3600000) {
-        return `${Math.floor(ms / 60000)}m ${Math.floor((ms % 60000) / 1000)}s`;
-    }
-    return `${Math.floor(ms / 3600000)}h ${Math.floor((ms % 3600000) / 60000)}m`;
-}
-
-async function loadScript(url) {
-    return new Promise((resolve, reject) => {
-        const script = document.createElement('script');
-        script.src = url; script.onload = resolve; script.onerror = reject;
-        document.head.appendChild(script);
-    });
-}
-
-function sanitizeFilename(name) {
-    return name.replace(/[/\\?%*:|"<>]/g, '_');
-}
-
 async function downloadNovel(title, episodeLinks, startEpisode, endEpisode, delayMs = 5000) {
     const dialog = document.createElement('div');
     Object.assign(dialog.style, {
@@ -361,7 +300,7 @@ async function downloadNovel(title, episodeLinks, startEpisode, endEpisode, dela
             let result = await fetchNovelContent(episodeUrl);
             if (!result) {
                 captchaCount++;
-                const userConfirmed = confirm(`Bypass alert or CAPTCHA trigger! \n${episodeUrl}\nPlease make sure the tab is active, wait a moment, and click OK.`);
+                const userConfirmed = confirm(`Bypass alert trigger! \n${episodeUrl}\nPlease make sure popups are allowed and click OK to retry.`);
                 if (!userConfirmed) { failedEpisodes++; continue; }
                 result = await fetchNovelContent(episodeUrl);
                 if (!result) { failedEpisodes++; continue; }
@@ -416,19 +355,13 @@ async function downloadNovel(title, episodeLinks, startEpisode, endEpisode, dela
 
 function extractTitle() {
     const titleElement = document.querySelector('.novel-detail h1');
-    if (titleElement) {
-        return titleElement.textContent.replace(/[&"']/g, '').trim();
-    }
-    if (document.title) {
-        return document.title.split('-')[0].replace(/[&"']/g, '').trim();
-    }
-    return null;
+    if (titleElement) return titleElement.textContent.replace(/[&"']/g, '').trim();
+    return document.title ? document.title.split('-')[0].replace(/[&"']/g, '').trim() : null;
 }
 
 function extractEpisodeLinks() {
     const links = document.querySelectorAll('.novel-eps li a');
-    const episodeLinks = Array.from(links).map(link => link.getAttribute('href')).filter(Boolean);
-    return episodeLinks.reverse();
+    return Array.from(links).map(link => link.getAttribute('href')).filter(Boolean).reverse();
 }
 
 async function runCrawler() {
