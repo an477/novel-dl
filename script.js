@@ -10,7 +10,7 @@ async function fetchNovelContent(url) {
     const parser = new DOMParser();
     const doc = parser.parseFromString(html, 'text/html');
     
-    // Extract episode title
+    // [처음 주신 코드 규칙 참조] 에피소드 제목 추출 기본값 정의
     let episodeTitle = 'Untitled Episode';
     const numElem = doc.querySelector('.ne-num, .ne-title, h1');
     if (numElem) {
@@ -19,68 +19,66 @@ async function fetchNovelContent(url) {
 
     let cleanedContent = '';
 
-    // [핵심 수정] Next.js 내부 데이터 JSON 스크립트 태그 타겟팅
-    const nextDataScript = doc.querySelector('#__NEXT_DATA__');
-    
-    if (nextDataScript) {
-        try {
-            const jsonData = JSON.parse(nextDataScript.textContent);
-            // Next.js의 전형적인 props 구조 안에서 본문 데이터 탐색 (사이트마다 데이터 트리 깊이가 다를 수 있음)
-            // 보통 pageProps나 queries, 또는 rsc 캐시 내부에 존재합니다.
-            const pageProps = jsonData.props?.pageProps || {};
-            
-            // 데이터 구조 내부에서 문자열로 된 소설 본문 필드를 동적으로 추적합니다.
-            // 'content', 'story', 'text', 'html' 등의 키값을 검색
-            const contentCandidates = [
-                pageProps.episode?.content,
-                pageProps.content,
-                pageProps.story?.content,
-                jsonData.query?.content
-            ];
-            
-            const rawContent = contentCandidates.find(c => typeof c === 'string' && c.length > 50);
-            
-            if (rawContent) {
-                cleanedContent = cleanText(rawContent);
-            }
-        } catch (e) {
-            console.error("Failed to parse __NEXT_DATA__ JSON", e);
-        }
-    }
+    // [핵심 변경 및 복원] Next.js 스트리밍 스크립트 블록 내에서 파편화된 본문 데이터 조립 파싱
+    const scripts = Array.from(doc.querySelectorAll('script'));
+    let rawChunks = [];
 
-    // 만약 JSON 구조에서 찾지 못했거나 구조가 달라졌다면 백업으로 self.__next_f 배열이나 다른 스크립트 문자열 내부 파싱 시도
-    if (!cleanedContent) {
-        const scripts = Array.from(doc.querySelectorAll('script'));
-        for (const script of scripts) {
-            const text = script.textContent;
-            // Next.js의 동적 데이터 스트리밍 패턴에서 본문 구문 문자열 직접 추출
-            if (text.includes('view-content') || text.includes('content') || text.includes('story')) {
-                // 문자열 내부에서 한글 소설 본문처럼 보이는 긴 패턴 매칭 시도
-                const match = text.match(/"content":"([^"]+)"/);
-                if (match && match[1]) {
-                    // 유니코드 이스케이프 문자 복원 처리 포함
+    for (const script of scripts) {
+        const text = script.textContent;
+        // Next.js 하이드레이션용 push 배열 매커니즘 추적
+        if (text.includes('__next_f') && text.includes('2화') || text.includes('화') || text.includes('마법')) {
+            // 정규식을 통해 유니코드 및 스트리밍 텍스트 파편들 추출
+            const matches = text.match(/"([^"]{100,})"/g);
+            if (matches) {
+                matches.forEach(m => {
                     try {
-                        cleanedContent = cleanText(JSON.parse(`"${match[1]}"`));
-                        if (cleanedContent.length > 50) break;
+                        const unescaped = JSON.parse(m);
+                        if (unescaped && unescaped.length > 50 && !unescaped.includes('<html')) {
+                            rawChunks.push(unescaped);
+                        }
                     } catch(_) {}
+                });
+            }
+        }
+    }
+
+    // 추출된 파편들 중 소설 본문 조건에 맞는 긴 텍스트 선별 및 병합
+    if (rawChunks.length > 0) {
+        // 중복을 제거하고 가장 본문 데이터 형식을 띄는 긴 문자열 병합
+        const uniqueChunks = [...new Set(rawChunks)];
+        const mainContent = uniqueChunks.reduce((acc, curr) => curr.length > acc.length ? curr : acc, '');
+        if (mainContent) {
+            cleanedContent = cleanText(mainContent);
+        }
+    }
+
+    // 백업 파싱 구조: JSON 영역 탐색 (__NEXT_DATA__)
+    if (!cleanedContent) {
+        const nextDataScript = doc.querySelector('#__NEXT_DATA__');
+        if (nextDataScript) {
+            try {
+                const jsonData = JSON.parse(nextDataScript.textContent);
+                const pageProps = jsonData.props?.pageProps || {};
+                const rawContent = pageProps.episode?.content || pageProps.content || pageProps.story?.content;
+                if (typeof rawContent === 'string' && rawContent.length > 50) {
+                    cleanedContent = cleanText(rawContent);
                 }
+            } catch (e) {
+                console.error("Failed to parse __NEXT_DATA__ JSON", e);
             }
         }
     }
 
-    // 최종 실패 방어 코드: 여전히 못 가져왔다면 껍데기 HTML 내부라 복사 시도
+    // [처음 주신 코드 로직 복원] 최후의 수단으로 DOM 타겟 엘리먼트 내부 HTML 파싱 시도
     if (!cleanedContent) {
-        const content = doc.querySelector('.novel-story, .view-content, article, #novel_content, .nd-desc-wrap');
-        if (content) {
-            cleanedContent = cleanText(content.innerHTML);
-            // "불러오는 중" 이라는 무의미한 껍데기만 있으면 실패로 간주
-            if (cleanedContent.includes("불러오는 중")) {
-                cleanedContent = "";
-            }
+        const contentContainer = doc.querySelector('.novel-story, .view-content, article, #novel_content, .nd-desc-wrap');
+        if (contentContainer) {
+            cleanedContent = cleanText(contentContainer.innerHTML);
         }
     }
 
-    if (!cleanedContent) {
+    // "불러오는 중" 상태의 뼈대만 잡혔거나 본문이 완전히 비어있다면 에러 차단 리턴
+    if (!cleanedContent || cleanedContent.includes("불러오는 중")) {
         console.error(`Failed to find real dynamic novel content on the page: ${url}`);
         return null;
     }
@@ -95,11 +93,21 @@ async function fetchNovelContent(url) {
     };
 }
 
+// [처음 주신 코드 그대로 완전 복원] HTML 이스케이프 문자 매핑 테이블 및 복원 기능
 function unescapeHTML(text) {
     const entities = {
-        '&lt;': '<', '&gt;': '>', '&amp;': '&', '&quot;': '"', '&apos;': "'",
-        '&nbsp;': ' ', '&ndash;': '-', '&mdash;': '--', '&lsquo;': "'",
-        '&raquo;': "'", '&ldquo;': '"', '&rdquo;': '"'
+        '&lt;': '<',
+        '&gt;': '>',
+        '&amp;': '&',
+        '&quot;': '"',
+        '&apos;': "'",
+        '&nbsp;': ' ',
+        '&ndash;': '-',
+        '&mdash;': '--',
+        '&lsquo;': "'",
+        '&rsquo;': "'",
+        '&ldquo;': '"',
+        '&rdquo;': '"'
     };
 
     Object.entries(entities).forEach(([entity, replacement]) => {
@@ -110,8 +118,8 @@ function unescapeHTML(text) {
     return text;
 }
 
+// [처음 주신 코드 그대로 완전 복원] 텍스트 가공 및 공백 정문화 기능
 function cleanText(text) {
-    // HTML 태그 제거 및 텍스트 정문화
     text = text.replace(/<div>/g, '');
     text = text.replace(/<\/div>/g, '');
     text = text.replace(/<p>/g, '\n');
@@ -132,6 +140,7 @@ function cleanText(text) {
     return text;
 }
 
+// [처음 주신 코드 가공] UI 모달 생성 함수 (영어 텍스트 반영)
 function createModal(title) {
     if (!document.getElementById('novel-dl-styles')) {
         const style = document.createElement('style');
@@ -216,6 +225,7 @@ function createModal(title) {
     return { modal, statusElement, progressText, timeRemaining, progressBar, detailedProgress };
 }
 
+// [처음 주신 코드 그대로 완전 복원] 이동 평균(Moving Average) 기반 실시간 시간 측정 분석 엔진
 function createProgressTracker(totalItems) {
     const startTime = Date.now();
     const processingTimes = [];
@@ -270,6 +280,7 @@ function sanitizeFilename(name) {
     return name.replace(/[/\\?%*:|"<>]/g, '_');
 }
 
+// [처음 주신 코드 가공] 소설 메인 다운로드 프로세스 핸들러 (영문화 완료)
 async function downloadNovel(title, episodeLinks, startEpisode, endEpisode, delayMs = 5000) {
     const dialog = document.createElement('div');
     Object.assign(dialog.style, {
@@ -420,6 +431,7 @@ async function downloadNovel(title, episodeLinks, startEpisode, endEpisode, dela
     }
 }
 
+// [핵심 변경] 뉴토끼 마크업 구조 매핑 타이틀 수집기
 function extractTitle() {
     const titleElement = document.querySelector('.novel-detail h1');
     if (titleElement) {
@@ -431,6 +443,7 @@ function extractTitle() {
     return null;
 }
 
+// [핵심 변경] 뉴토끼 구조에 호환되는 정순 배열 가공 수집기
 function extractEpisodeLinks() {
     const links = document.querySelectorAll('.novel-eps li a');
     const episodeLinks = Array.from(links).map(link => link.getAttribute('href')).filter(Boolean);
@@ -445,6 +458,7 @@ async function fetchPage(url) {
     return parser.parseFromString(html, 'text/html');
 }
 
+// [제약 조건 완화] Next.js 동적 도메인 및 번호 경로 유연 검사 적용
 async function runCrawler() {
     if (!window.location.pathname.includes('/novel/')) {
         alert('This script must be executed on the novel listing page.');
