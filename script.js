@@ -1,6 +1,6 @@
 async function fetchNovelContent(url) {
     return new Promise((resolve) => {
-        // 1. 각 회차별 페이지를 실제 팝업 창으로 오픈
+        // 1. 보안 세션 유지를 위해 실제 팝업 창 오픈
         const popup = window.open(url, '_blank', 'width=800,height=600,noopener=false,noreferrer=false');
         
         if (!popup) {
@@ -15,10 +15,9 @@ async function fetchNovelContent(url) {
         const timer = setInterval(() => {
             checkAttempts++;
             try {
-                const popupWindow = popup.window;
                 const popupDoc = popup.document;
                 
-                // 팝업 창의 body가 존재하고, Next.js의 "불러오는 중..." 문구가 완전히 사라졌을 때 작업 개시
+                // "불러오는 중..." 문구가 완전히 사라지고 화면에 글자가 풀렸을 때 작동
                 if (popupDoc && popupDoc.body && !popupDoc.body.innerText.includes("불러오는 중") && popupDoc.body.innerText.length > 300) {
                     clearInterval(timer);
                     
@@ -29,52 +28,55 @@ async function fetchNovelContent(url) {
                         episodeTitle = numElem.textContent.trim();
                     }
 
-                    // 2. [팝업 창 내부에서 Ctrl + A 직접 수행 효과 구현]
-                    // 팝업 창의 window context에서 Selection 객체를 생성하여 전범위를 블록 지정합니다.
-                    const range = popupDoc.createRange();
-                    range.selectNodeContents(popupDoc.body);
+                    // 2. [보안 돌파 핵심] 복사 방지/전체선택 차단 엔진을 완전히 우회하는 기믹
+                    // 브라우저 렌더링 트리에서 순수 '텍스트 노드'만 추적하여 배열에 담아 합칩니다.
+                    // 이 방식은 드래그나 Selection 명령을 쓰지 않으므로 차단 스크립트가 감지할 수 없습니다.
+                    const textNodes = [];
+                    const walk = popupDoc.createTreeWalker(popupDoc.body, NodeFilter.SHOW_TEXT, null, false);
+                    let node;
+                    while (node = walk.nextNode()) {
+                        const trimmed = node.nodeValue.trim();
+                        // 공백이 아니고, 스크립트 소스코드가 아닌 순수 화면 노출 텍스트만 선별
+                        if (trimmed && !node.parentNode.matches('script, style, noscript, button')) {
+                            textNodes.push(node.nodeValue);
+                        }
+                    }
                     
-                    const selection = popupWindow.getSelection();
-                    selection.removeAllRanges();
-                    selection.addRange(range); // 팝업 창 내부 전체 선택 완료 (Ctrl + A 상태)
+                    // 전체 선택(Ctrl+A)해서 긁어온 것과 완벽히 동일한 원본 문자열 스트림 조립
+                    const combinedRawText = textNodes.join('\n');
 
-                    // 3. 복사(Ctrl + C) 처리된 순수 문자열 데이터를 가로채기
-                    const grabbedRawText = selection.toString();
-
-                    // Selection 영역 메모리 해제 및 팝업 닫기
-                    selection.removeAllRanges();
+                    // 수집 끝났으므로 팝업 창 종료
                     popup.close();
 
-                    // 4. [편집 및 정제 로직] 
-                    // 전체 선택으로 복사된 덩어리에서 불필요한 위아래 영역 도려내기
+                    // 3. [요청하신 상하단 잘라내기 가공 처리]
                     let cleanedContent = '';
                     
-                    // "16px\n+\n기본" 또는 "16px + 기본" 레이아웃 문자열 위치 탐색
+                    // "16px\n+\n기본" 등 툴바 문자열 위치 매칭용 유연한 정규식
                     const topMarkerRegex = /16\s*px[\s\+\-±\n]*기본/;
-                    const topMatch = grabbedRawText.match(topMarkerRegex);
+                    const topMatch = combinedRawText.match(topMarkerRegex);
 
                     if (topMatch) {
-                        // "기본" 텍스트 위쪽(상단 광고, 메뉴 등)을 전부 잘라냄
-                        const upperSliced = grabbedRawText.substring(topMatch.index + topMatch[0].length).trim();
+                        // "기본" 위쪽 영역(상단 메뉴 등) 가차없이 삭제
+                        const upperSliced = combinedRawText.substring(topMatch.index + topMatch[0].length).trim();
                         
-                        // 하단 뷰어 종료 시점 내비게이션 바인 "‹ 이전화" 또는 "목록" 위치 탐색
+                        // 하단 뷰어 내비게이션 바인 "‹ 이전화" 또는 "목록" 위치 추적
                         let bottomIndex = upperSliced.lastIndexOf("‹ 이전화");
                         if (bottomIndex === -1 || bottomIndex < (upperSliced.length * 0.5)) {
                             bottomIndex = upperSliced.lastIndexOf("목록");
                         }
                         
-                        // 찾았다면 하단 메뉴 찌꺼기 완벽 차단 및 삭제
+                        // 찾았다면 하단 댓글/목록 메뉴 영역 미련 없이 삭제
                         if (bottomIndex !== -1 && bottomIndex > 50) {
                             cleanedContent = upperSliced.substring(0, bottomIndex).trim();
                         } else {
                             cleanedContent = upperSliced;
                         }
                     } else {
-                        // 기준점 매칭에 예외가 발생했을 경우 복사된 원본 그대로 보존 처리
-                        cleanedContent = grabbedRawText;
+                        // 기준점 매칭 실패 시 수집된 전체 텍스트 보존 처리
+                        cleanedContent = combinedRawText;
                     }
 
-                    // 최종 포맷 가공 후 반환
+                    // 줄바꿈 정돈 규칙 적용 후 반환
                     cleanedContent = cleanText(cleanedContent);
                     if (cleanedContent.startsWith(episodeTitle)) {
                         cleanedContent = cleanedContent.slice(episodeTitle.length).trim();
@@ -86,12 +88,12 @@ async function fetchNovelContent(url) {
                     });
                 }
             } catch (e) {
-                // 페이지가 전환되거나 로딩 중일 때 발생하는 Cross-Origin 브라우저 에러 임시 차단
+                // 로딩 찰나의 순간 도메인 예외 에러 무시
             }
 
             if (checkAttempts >= maxAttempts) {
                 clearInterval(timer);
-                console.error(`Timeout waiting for popup text generation on: ${url}`);
+                console.error(`Timeout waiting for memory text tree extraction on: ${url}`);
                 try { popup.close(); } catch(_) {}
                 resolve(null);
             }
