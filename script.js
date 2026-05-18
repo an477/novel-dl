@@ -1,62 +1,74 @@
-// [완전 개조] fetch 대신 가상 iframe을 사용하여 브라우저 렌더링을 가로채는 방식
 async function fetchNovelContent(url) {
     return new Promise((resolve) => {
-        // 보이지 않는 가상 iframe 생성
+        // 1. 실제 사용자가 웹 브라우저로 보는 것과 동일한 환경을 만들기 위해 가상 iframe 생성
         const iframe = document.createElement('iframe');
         iframe.style.display = 'none';
         iframe.src = url;
         document.body.appendChild(iframe);
 
-        // 페이지가 완전히 로드되고 자바스크립트가 실행될 때까지 대기
         iframe.onload = async () => {
             try {
-                // iframe 내부의 DOM에 접근
                 const iframeDoc = iframe.contentDocument || iframe.contentWindow.document;
                 
-                // 충분히 하이드레이션이 끝날 시간을 주기 위해 아주 잠깐 대기 (300ms)
-                await new Promise(r => setTimeout(r, 300));
+                // Next.js 동적 스크립트가 실행되어 본문이 화면에 완전히 그려질 때까지 700ms 대기
+                await new Promise(r => setTimeout(r, 700));
 
-                // [처음 주신 코드 규칙 매핑] 에피소드 제목 추출
+                // 에피소드 제목 추출
                 let episodeTitle = 'Untitled Episode';
                 const numElem = iframeDoc.querySelector('.ne-h1, .ne-num, h1');
                 if (numElem) {
                     episodeTitle = numElem.textContent.trim();
                 }
 
-                // [중요] 복사 방지가 풀리고 렌더링이 완료된 실제 화면의 텍스트 노드 영역 타겟팅
-                // 복사 방지 스크립트가 돌아도 DOM 트리 내부의 텍스트 데이터는 무조건 잡힙니다.
-                const contentContainer = iframeDoc.querySelector('.novel-viewer, article, .view-content, #novel_content');
+                // 2. [Ctrl + A] 후 복사하는 것과 동일하게 화면에 렌더링된 전체 텍스트(innerText) 가로채기
+                // 복사 방지 스크립트가 작동 중이어도 브라우저 내부 런타임 텍스트는 무조건 잡힙니다.
+                const fullText = iframeDoc.body.innerText;
+
+                // 3. [텍스트 자르기 로직 적용]
                 let cleanedContent = '';
+                
+                // "16px\n+\n기본" 또는 "16px + 기본" 형태로 렌더링되는 기준점 탐색
+                // 다양한 줄바꿈 공백 리터럴을 방어하기 위해 정규식 패턴 사용
+                const topMarkerRegex = /16\s*px\s*[\-\+±]?\s*기본/;
+                const topMatch = fullText.match(topMarkerRegex);
 
-                if (contentContainer) {
-                    cleanedContent = cleanText(contentContainer.innerHTML);
-                }
-
-                // 로딩 중이거나 본문이 완전히 누락되었다면 최후의 수단으로 iframe의 전체 textContent에서 본문 유추
-                if (!cleanedContent || cleanedContent.includes("불러오는 중") || cleanedContent.length < 50) {
-                    const allText = iframeDoc.body.textContent;
-                    // 소설 독자용 뷰어 텍스트 필터링 시도
-                    if (allText && allText.includes("글자")) {
-                        const parts = allText.split("기본");
-                        if (parts[1]) {
-                            cleanedContent = cleanText(parts[1].split("댓글")[0]);
-                        }
+                if (topMatch) {
+                    // 상단 기준점 위쪽(불필요한 헤더 및 유틸 메뉴) 제거
+                    const uppercaseSlice = fullText.substring(topMatch.index + topMatch[0].length);
+                    
+                    // 하단 기준점 "‹ 이전화\n목록\n다음화 ›" 또는 "목록\n다음화 ›" 탐색하여 잘라내기
+                    const bottomMarker = "목록";
+                    const bottomIndex = uppercaseSlice.indexOf(bottomMarker);
+                    
+                    if (bottomIndex !== -1) {
+                        cleanedContent = uppercaseSlice.substring(0, bottomIndex).trim();
+                    } else {
+                        // 목록 글자를 못 찾았을 경우 "댓글" 선에서 차단하는 예외 방어코드
+                        const commentIndex = uppercaseSlice.indexOf("댓글");
+                        cleanedContent = commentIndex !== -1 ? uppercaseSlice.substring(0, commentIndex).trim() : uppercaseSlice.trim();
                     }
                 }
 
-                // 가상 엘리먼트 메모리 해제
+                // 가상 창 메모리 해제
                 document.body.removeChild(iframe);
 
-                if (!cleanedContent || cleanedContent.includes("불러오는 중") || cleanedContent.length < 50) {
+                // 상하단 정제기가 정상 작동했는지 텍스트 유효성 검증
+                if (!cleanedContent || cleanedContent.includes("불러오는 중") || cleanedContent.length < 30) {
+                    console.error(`Failed to slice pure content properly from URL: ${url}`);
                     resolve(null);
                 } else {
+                    // 최종 본문 텍스트 규격화 정돈 후 반환
+                    cleanedContent = cleanText(cleanedContent);
                     if (cleanedContent.startsWith(episodeTitle)) {
                         cleanedContent = cleanedContent.slice(episodeTitle.length).trim();
                     }
-                    resolve({ episodeTitle, content: cleanedContent });
+                    resolve({
+                        episodeTitle: episodeTitle,
+                        content: cleanedContent
+                    });
                 }
             } catch (e) {
-                console.error("Bypass via iframe context failed:", e);
+                console.error(`Error context processing inside iframe for ${url}:`, e);
                 try { document.body.removeChild(iframe); } catch(_) {}
                 resolve(null);
             }
@@ -70,32 +82,23 @@ function unescapeHTML(text) {
         '&nbsp;': ' ', '&ndash;': '-', '&mdash;': '--', '&lsquo;': "'",
         '&raquo;': "'", '&ldquo;': '"', '&rdquo;': '"'
     };
+
     Object.entries(entities).forEach(([entity, replacement]) => {
         const regex = new RegExp(entity, 'g');
         text = text.replace(regex, replacement);
     });
+
     return text;
 }
 
 function cleanText(text) {
-    text = text.replace(/<div>/g, '');
-    text = text.replace(/<\/div>/g, '');
-    text = text.replace(/<p>/g, '\n');
-    text = text.replace(/<\/p>/g, '\n');
-    text = text.replace(/<br\s*[/]?>/g, '\n');
-    text = text.replace(/<img[^>]*>/gi, '[skipped image]');
-    text = text.replace(/<[^>]*>/g, '');
-    text = text.replace(/ {2,}/g, ' ');
     text = unescapeHTML(text);
-
-    text = text
+    return text
         .split('\n')
         .map(line => line.trim())
         .filter(line => line.length > 0)
         .join('\n\n')
         .replace(/\n{3,}/g, '\n\n');
-
-    return text;
 }
 
 function createModal(title) {
@@ -215,19 +218,360 @@ function createProgressTracker(totalItems) {
     };
 }
 
-function downloadNovel(title, episodeLinks, startEpisode, endEpisode, delayMs = 5000) {
-    // [UI 구성 파트는 이전 답변과 동일하여 중복 생략, 가상 렌더링 데이터 엔진 결합 구동됨]
+function formatTime(ms) {
+    if (ms < 1000) return "Please wait...";
+    if (ms < 60000) return `${Math.ceil(ms / 1000)}s`;
+    if (ms < 3600000) {
+        return `${Math.floor(ms / 60000)}m ${Math.floor((ms % 60000) / 1000)}s`;
+    }
+    return `${Math.floor(ms / 3600000)}h ${Math.floor((ms % 3600000) / 60000)}m`;
+}
+
+async function loadScript(url) {
+    return new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = url; script.onload = resolve; script.onerror = reject;
+        document.head.appendChild(script);
+    });
+}
+
+function sanitizeFilename(name) {
+    return name.replace(/[/\\?%*:|"<>]/g, '_');
+}
+
+async function downloadNovel(title, episodeLinks, startEpisode, endEpisode, delayMs = 5000) {
+    const dialog = document.createElement('div');
+    Object.assign(dialog.style, {
+        position: 'fixed', zIndex: '9999', left: '0', top: '0', width: '100%', height: '100%',
+        backgroundColor: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+        fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif'
+    });
+
+    const dialogContent = document.createElement('div');
+    Object.assign(dialogContent.style, {
+        backgroundColor: '#fff', borderRadius: '12px', boxShadow: '0 4px 24px rgba(0,0,0,0.15)',
+        width: '350px', maxWidth: '90%', padding: '24px', animation: 'fadeIn 0.3s'
+    });
+
+    const dialogTitle = document.createElement('h3');
+    dialogTitle.textContent = 'Select Save Mode';
+    Object.assign(dialogTitle.style, { margin: '0 0 20px 0', color: '#172238', fontSize: '18px', fontWeight: '600' });
+    dialogContent.appendChild(dialogTitle);
+
+    const optionsContainer = document.createElement('div');
+    Object.assign(optionsContainer.style, { display: 'flex', flexDirection: 'column', gap: '12px', marginBottom: '24px' });
+
+    const createOption = (value, text, description) => {
+        const option = document.createElement('div');
+        Object.assign(option.style, {
+            padding: '14px', border: '1px solid #e4e9f0', borderRadius: '8px',
+            cursor: 'pointer', backgroundColor: '#f9f9fb', transition: 'all 0.2s ease'
+        });
+        option.innerHTML = `
+            <div style="font-weight: 600; color: #172238; margin-bottom: 4px;">${text}</div>
+            <div style="font-size: 13px; color: #666;">${description}</div>
+        `;
+        option.onclick = () => {
+            document.body.removeChild(dialog);
+            processDownload(value === '1' ? false : true);
+        };
+        option.onmouseover = () => { option.style.backgroundColor = '#f0f2f8'; option.style.borderColor = '#3a7bd5'; };
+        option.onmouseout = () => { option.style.backgroundColor = '#f9f9fb'; option.style.borderColor = '#e4e9f0'; };
+        return option;
+    };
+
+    optionsContainer.appendChild(createOption('1', 'Merge into a single file', 'All episodes will be saved in a single text file.'));
+    optionsContainer.appendChild(createOption('2', 'Save per episode (ZIP)', 'Each episode will be saved as an individual text file inside a ZIP archive.'));
+    dialogContent.appendChild(optionsContainer);
+    
+    const cancelButton = document.createElement('button');
+    cancelButton.textContent = 'Cancel';
+    Object.assign(cancelButton.style, {
+        width: '100%', padding: '10px', border: '1px solid #e4e9f0', borderRadius: '8px',
+        backgroundColor: '#f9f9fb', cursor: 'pointer', fontSize: '14px', fontWeight: '500'
+    });
+    cancelButton.onclick = () => document.body.removeChild(dialog);
+    dialogContent.appendChild(cancelButton);
+    dialog.appendChild(dialogContent);
+    document.body.appendChild(dialog);
+
+    async function processDownload(saveAsZip) {
+        let zip;
+        if (saveAsZip) {
+            try {
+                await loadScript('https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js');
+                zip = new JSZip();
+            } catch (e) {
+                alert('Failed to load ZIP library!');
+                return;
+            }
+        }
+
+        const startingIndex = startEpisode - 1;
+        const endingIndex = endEpisode - 1;
+        const totalEpisodes = endingIndex - startingIndex + 1;
+
+        const { modal, statusElement, progressText, timeRemaining, progressBar, detailedProgress } = createModal(`"${title}" Downloading`);
+        document.body.appendChild(modal);
+        
+        const progressTracker = createProgressTracker(totalEpisodes);
+        let novelText = `${title}\n\nDownloaded with novel-dl\n\n`;
+        let completedEpisodes = 0;
+        let failedEpisodes = 0;
+        let captchaCount = 0;
+
+        statusElement.textContent = 'Preparing download...';
+        
+        for (let i = startingIndex; i <= endingIndex; i++) {
+            let episodeUrl = episodeLinks[i];
+            if (!episodeUrl) continue;
+            
+            if (episodeUrl.startsWith('/')) {
+                episodeUrl = window.location.origin + episodeUrl;
+            }
+
+            const currentEpisode = i - startingIndex + 1;
+            statusElement.textContent = `Downloading... (${currentEpisode}/${totalEpisodes})`;
+
+            let result = await fetchNovelContent(episodeUrl);
+            if (!result) {
+                captchaCount++;
+                const userConfirmed = confirm(`Bypass alert trigger! \n${episodeUrl}\nPlease maximize the window and ensure the page text has loaded properly on the back, then click OK.`);
+                if (!userConfirmed) { failedEpisodes++; continue; }
+                result = await fetchNovelContent(episodeUrl);
+                if (!result) { failedEpisodes++; continue; }
+            }
+
+            const { episodeTitle, content} = result;
+            if (saveAsZip) {
+                zip.file(`${sanitizeFilename(episodeTitle)}.txt`, content);
+            } else {
+                novelText += `${episodeTitle}\n\n${content}\n\n`;
+            }
+
+            completedEpisodes++;
+            const stats = progressTracker.update(completedEpisodes);
+            
+            progressBar.style.width = `${stats.progress}%`;
+            progressText.textContent = `${stats.progress}%`;
+            timeRemaining.textContent = `Time remaining: ${stats.remaining}`;
+            detailedProgress.innerHTML = `
+                <div style="margin-bottom: 4px; display: flex; justify-content: center; gap: 12px;">
+                    <span>✅ OK: ${completedEpisodes}</span>
+                    <span>❌ Fail: ${failedEpisodes}</span>
+                </div>
+                <div>Elapsed: ${stats.elapsed} | Speed: ${stats.speed} ep/s</div>
+            `;
+            await new Promise(r => setTimeout(r, delayMs));
+        }
+
+        statusElement.textContent = '✅ Completed!';
+        progressBar.style.width = '100%';
+        progressText.textContent = '100%';
+        
+        setTimeout(() => {
+            document.body.removeChild(modal);
+            if (saveAsZip) {
+                zip.generateAsync({type: 'blob'}).then(blob => {
+                    const a = document.createElement('a');
+                    a.href = URL.createObjectURL(blob);
+                    a.download = `${sanitizeFilename(title)}.zip`;
+                    a.click();
+                });
+            } else {
+                const blob = new Blob([novelText], {type: 'text/plain'});
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
+                a.download = `${sanitizeFilename(title)}(${startEpisode}-${endEpisode}).txt`;
+                a.click();
+            }
+        }, 500);
+    }
 }
 
 function extractTitle() {
     const titleElement = document.querySelector('.novel-detail h1');
-    if (titleElement) return titleElement.textContent.replace(/[&"']/g, '').trim();
-    return document.title ? document.title.split('-')[0].replace(/[&"']/g, '').trim() : null;
+    if (titleElement) {
+        return titleElement.textContent.replace(/[&"']/g, '').trim();
+    }
+    if (document.title) {
+        return document.title.split('-')[0].replace(/[&"']/g, '').trim();
+    }
+    return null;
 }
 
 function extractEpisodeLinks() {
     const links = document.querySelectorAll('.novel-eps li a');
-    return Array.from(links).map(link => link.getAttribute('href')).filter(Boolean).reverse();
+    const episodeLinks = Array.from(links).map(link => link.getAttribute('href')).filter(Boolean);
+    return episodeLinks.reverse();
 }
 
-// ...이하 runCrawler() 바인딩 로직 구동 동일
+async function fetchPage(url) {
+    const response = await fetch(url);
+    if (!response.ok) return null;
+    const html = await response.text();
+    const parser = new DOMParser();
+    return parser.parseFromString(html, 'text/html');
+}
+
+async function runCrawler() {
+    if (!window.location.pathname.includes('/novel/')) {
+        alert('This script must be executed on the novel listing page.');
+        return;
+    }
+
+    const title = extractTitle();
+    if (!title) {
+        alert('Failed to extract the novel title.');
+        return;
+    }
+
+    const dialog = document.createElement('div');
+    Object.assign(dialog.style, {
+        position: 'fixed', zIndex: '9999', left: '0', top: '0', width: '100%', height: '100%',
+        backgroundColor: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+        fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif'
+    });
+
+    const dialogContent = document.createElement('div');
+    Object.assign(dialogContent.style, {
+        backgroundColor: '#fff', borderRadius: '12px', boxShadow: '0 4px 24px rgba(0,0,0,0.15)',
+        width: '400px', maxWidth: '90%', padding: '24px', animation: 'fadeIn 0.3s'
+    });
+
+    const dialogTitle = document.createElement('h3');
+    dialogTitle.textContent = `"${title}" Settings`;
+    Object.assign(dialogTitle.style, { margin: '0 0 20px 0', color: '#172238', fontSize: '18px', fontWeight: '600' });
+    dialogContent.appendChild(dialogTitle);
+
+    function createInputGroup(labelText, inputType, defaultValue, placeholder, description) {
+        const group = document.createElement('div');
+        group.style.marginBottom = '20px';
+        
+        const label = document.createElement('label');
+        label.textContent = labelText;
+        Object.assign(label.style, { display: 'block', marginBottom: '8px', fontSize: '14px', color: '#444', fontWeight: '500' });
+        group.appendChild(label);
+        
+        if (description) {
+            const desc = document.createElement('div');
+            desc.textContent = description;
+            Object.assign(desc.style, { fontSize: '13px', color: '#666', marginBottom: '8px' });
+            group.appendChild(desc);
+        }
+        
+        const input = document.createElement('input');
+        input.type = inputType; input.value = defaultValue; input.placeholder = placeholder || '';
+        Object.assign(input.style, { width: '100%', padding: '10px', border: '1px solid #e4e9f0', borderRadius: '8px', fontSize: '14px', boxSizing: 'border-box' });
+        group.appendChild(input);
+        
+        return { group, input };
+    }
+
+    const pagesInput = createInputGroup('Number of List Pages', 'number', '1', '', 'If all episodes are loaded on one page, keep it as 1.');
+    dialogContent.appendChild(pagesInput.group);
+
+    const buttonsContainer = document.createElement('div');
+    Object.assign(buttonsContainer.style, { display: 'flex', justifyContent: 'space-between', marginTop: '16px', gap: '12px' });
+
+    const cancelButton = document.createElement('button');
+    cancelButton.textContent = 'Cancel';
+    Object.assign(cancelButton.style, {
+        flex: '1', padding: '10px', border: '1px solid #e4e9f0', borderRadius: '8px', backgroundColor: '#f9f9fb', cursor: 'pointer'
+    });
+    cancelButton.onclick = () => document.body.removeChild(dialog);
+    buttonsContainer.appendChild(cancelButton);
+
+    const continueButton = document.createElement('button');
+    continueButton.textContent = 'Continue';
+    Object.assign(continueButton.style, {
+        flex: '1', padding: '10px', border: 'none', borderRadius: '8px', backgroundColor: '#3a7bd5', color: 'white', cursor: 'pointer'
+    });
+    buttonsContainer.appendChild(continueButton);
+    dialogContent.appendChild(buttonsContainer);
+    dialog.appendChild(dialogContent);
+    document.body.appendChild(dialog);
+
+    continueButton.onclick = async () => {
+        document.body.removeChild(dialog);
+
+        const loadingDialog = document.createElement('div');
+        Object.assign(loadingDialog.style, {
+            position: 'fixed', zIndex: '9999', left: '0', top: '0', width: '100%', height: '100%',
+            backgroundColor: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center'
+        });
+        const loadingContent = document.createElement('div');
+        Object.assign(loadingContent.style, { backgroundColor: '#fff', borderRadius: '12px', width: '300px', padding: '24px', textAlign: 'center' });
+        const loadingText = document.createElement('p');
+        loadingText.textContent = 'Loading episode list...';
+        loadingContent.appendChild(loadingText);
+        loadingDialog.appendChild(loadingContent);
+        document.body.appendChild(loadingDialog);
+
+        const allEpisodeLinks = extractEpisodeLinks();
+        document.body.removeChild(loadingDialog);
+
+        if (allEpisodeLinks.length === 0) {
+            alert('Failed to fetch the episode list. Please check the page structure.');
+            return;
+        }
+
+        const rangeDialog = document.createElement('div');
+        Object.assign(rangeDialog.style, {
+            position: 'fixed', zIndex: '9999', left: '0', top: '0', width: '100%', height: '100%',
+            backgroundColor: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+            fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif'
+        });
+
+        const rangeContent = document.createElement('div');
+        Object.assign(rangeContent.style, { backgroundColor: '#fff', borderRadius: '12px', width: '400px', padding: '24px' });
+
+        const rangeTitle = document.createElement('h3');
+        rangeTitle.textContent = 'Configure Download Range';
+        rangeContent.appendChild(rangeTitle);
+
+        const episodeCount = document.createElement('div');
+        episodeCount.innerHTML = `<span style="background-color: #ebf5ff; color: #3a7bd5; padding: 4px 8px; border-radius: 4px;">Total ${allEpisodeLinks.length} Episodes</span>`;
+        rangeContent.appendChild(episodeCount);
+
+        const startInput = createInputGroup('Start Episode', 'number', '1', '');
+        rangeContent.appendChild(startInput.group);
+
+        const endInput = createInputGroup('End Episode', 'number', allEpisodeLinks.length.toString(), '');
+        rangeContent.appendChild(endInput.group);
+        
+        const delayInput = createInputGroup('Delay (ms)', 'number', '5000', '', '⚠️ Recommended: Keep 5000ms (5s) to avoid blocks.');
+        rangeContent.appendChild(delayInput.group);
+
+        const rangeButtons = document.createElement('div');
+        Object.assign(rangeButtons.style, { display: 'flex', justifyContent: 'space-between', marginTop: '20px', gap: '12px' });
+
+        const rangeCancelButton = document.createElement('button');
+        rangeCancelButton.textContent = 'Cancel';
+        rangeCancelButton.onclick = () => document.body.removeChild(rangeDialog);
+        rangeButtons.appendChild(rangeCancelButton);
+
+        const downloadButton = document.createElement('button');
+        downloadButton.textContent = 'Download';
+        rangeButtons.appendChild(downloadButton);
+        rangeContent.appendChild(rangeButtons);
+        rangeDialog.appendChild(rangeContent);
+        document.body.appendChild(rangeDialog);
+
+        downloadButton.onclick = () => {
+            const startEpisode = parseInt(startInput.input.value, 10);
+            const endEpisode = parseInt(endInput.input.value, 10);
+            const delay = parseInt(delayInput.input.value, 10);
+
+            if (isNaN(startEpisode) || isNaN(endEpisode) || startEpisode < 1 || endEpisode < startEpisode || endEpisode > allEpisodeLinks.length) {
+                alert('Please enter a valid episode range.');
+                return;
+            }
+
+            document.body.removeChild(rangeDialog);
+            downloadNovel(title, allEpisodeLinks, startEpisode, endEpisode, delay);
+        };
+    };
+}
+
+runCrawler();
