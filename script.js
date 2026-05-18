@@ -17,14 +17,74 @@ async function fetchNovelContent(url) {
         episodeTitle = numElem.textContent.trim();
     }
 
-    // Target content container
-    const content = doc.querySelector('.novel-story, .view-content, article, #novel_content, .nd-desc-wrap');
-    if (!content) {
-        console.error(`Failed to find novel content container on the page: ${url}`);
+    let cleanedContent = '';
+
+    // [핵심 수정] Next.js 내부 데이터 JSON 스크립트 태그 타겟팅
+    const nextDataScript = doc.querySelector('#__NEXT_DATA__');
+    
+    if (nextDataScript) {
+        try {
+            const jsonData = JSON.parse(nextDataScript.textContent);
+            // Next.js의 전형적인 props 구조 안에서 본문 데이터 탐색 (사이트마다 데이터 트리 깊이가 다를 수 있음)
+            // 보통 pageProps나 queries, 또는 rsc 캐시 내부에 존재합니다.
+            const pageProps = jsonData.props?.pageProps || {};
+            
+            // 데이터 구조 내부에서 문자열로 된 소설 본문 필드를 동적으로 추적합니다.
+            // 'content', 'story', 'text', 'html' 등의 키값을 검색
+            const contentCandidates = [
+                pageProps.episode?.content,
+                pageProps.content,
+                pageProps.story?.content,
+                jsonData.query?.content
+            ];
+            
+            const rawContent = contentCandidates.find(c => typeof c === 'string' && c.length > 50);
+            
+            if (rawContent) {
+                cleanedContent = cleanText(rawContent);
+            }
+        } catch (e) {
+            console.error("Failed to parse __NEXT_DATA__ JSON", e);
+        }
+    }
+
+    // 만약 JSON 구조에서 찾지 못했거나 구조가 달라졌다면 백업으로 self.__next_f 배열이나 다른 스크립트 문자열 내부 파싱 시도
+    if (!cleanedContent) {
+        const scripts = Array.from(doc.querySelectorAll('script'));
+        for (const script of scripts) {
+            const text = script.textContent;
+            // Next.js의 동적 데이터 스트리밍 패턴에서 본문 구문 문자열 직접 추출
+            if (text.includes('view-content') || text.includes('content') || text.includes('story')) {
+                // 문자열 내부에서 한글 소설 본문처럼 보이는 긴 패턴 매칭 시도
+                const match = text.match(/"content":"([^"]+)"/);
+                if (match && match[1]) {
+                    // 유니코드 이스케이프 문자 복원 처리 포함
+                    try {
+                        cleanedContent = cleanText(JSON.parse(`"${match[1]}"`));
+                        if (cleanedContent.length > 50) break;
+                    } catch(_) {}
+                }
+            }
+        }
+    }
+
+    // 최종 실패 방어 코드: 여전히 못 가져왔다면 껍데기 HTML 내부라 복사 시도
+    if (!cleanedContent) {
+        const content = doc.querySelector('.novel-story, .view-content, article, #novel_content, .nd-desc-wrap');
+        if (content) {
+            cleanedContent = cleanText(content.innerHTML);
+            // "불러오는 중" 이라는 무의미한 껍데기만 있으면 실패로 간주
+            if (cleanedContent.includes("불러오는 중")) {
+                cleanedContent = "";
+            }
+        }
+    }
+
+    if (!cleanedContent) {
+        console.error(`Failed to find real dynamic novel content on the page: ${url}`);
         return null;
     }
 
-    let cleanedContent = cleanText(content.innerHTML);
     if (cleanedContent.startsWith(episodeTitle)) {
         cleanedContent = cleanedContent.slice(episodeTitle.length).trim();
     }
@@ -51,6 +111,7 @@ function unescapeHTML(text) {
 }
 
 function cleanText(text) {
+    // HTML 태그 제거 및 텍스트 정문화
     text = text.replace(/<div>/g, '');
     text = text.replace(/<\/div>/g, '');
     text = text.replace(/<p>/g, '\n');
@@ -113,7 +174,6 @@ function createModal(title) {
     Object.assign(closeButton.style, {
         background: 'none', border: 'none', fontSize: '22px', cursor: 'pointer', color: '#666', padding: '0 4px', lineHeight: '1'
     });
-    // [Modified to English]
     closeButton.onclick = () => { if (confirm('Do you want to cancel the download?')) { document.body.removeChild(modal); } };
     header.appendChild(closeButton);
     modalContent.appendChild(header);
@@ -189,7 +249,6 @@ function createProgressTracker(totalItems) {
     };
 }
 
-// [Modified to English]
 function formatTime(ms) {
     if (ms < 1000) return "Please wait...";
     if (ms < 60000) return `${Math.ceil(ms / 1000)}s`;
@@ -225,7 +284,6 @@ async function downloadNovel(title, episodeLinks, startEpisode, endEpisode, dela
         width: '350px', maxWidth: '90%', padding: '24px', animation: 'fadeIn 0.3s'
     });
 
-    // [Modified to English]
     const dialogTitle = document.createElement('h3');
     dialogTitle.textContent = 'Select Save Mode';
     Object.assign(dialogTitle.style, { margin: '0 0 20px 0', color: '#172238', fontSize: '18px', fontWeight: '600' });
@@ -253,12 +311,10 @@ async function downloadNovel(title, episodeLinks, startEpisode, endEpisode, dela
         return option;
     };
 
-    // [Modified to English]
     optionsContainer.appendChild(createOption('1', 'Merge into a single file', 'All episodes will be saved in a single text file.'));
     optionsContainer.appendChild(createOption('2', 'Save per episode (ZIP)', 'Each episode will be saved as an individual text file inside a ZIP archive.'));
     dialogContent.appendChild(optionsContainer);
     
-    // [Modified to English]
     const cancelButton = document.createElement('button');
     cancelButton.textContent = 'Cancel';
     Object.assign(cancelButton.style, {
@@ -286,7 +342,6 @@ async function downloadNovel(title, episodeLinks, startEpisode, endEpisode, dela
         const endingIndex = endEpisode - 1;
         const totalEpisodes = endingIndex - startingIndex + 1;
 
-        // [Modified to English]
         const { modal, statusElement, progressText, timeRemaining, progressBar, detailedProgress } = createModal(`"${title}" Downloading`);
         document.body.appendChild(modal);
         
@@ -296,7 +351,6 @@ async function downloadNovel(title, episodeLinks, startEpisode, endEpisode, dela
         let failedEpisodes = 0;
         let captchaCount = 0;
 
-        // [Modified to English]
         statusElement.textContent = 'Preparing download...';
         
         for (let i = startingIndex; i <= endingIndex; i++) {
@@ -308,13 +362,11 @@ async function downloadNovel(title, episodeLinks, startEpisode, endEpisode, dela
             }
 
             const currentEpisode = i - startingIndex + 1;
-            // [Modified to English]
             statusElement.textContent = `Downloading... (${currentEpisode}/${totalEpisodes})`;
 
             let result = await fetchNovelContent(episodeUrl);
             if (!result) {
                 captchaCount++;
-                // [Modified to English]
                 const userConfirmed = confirm(`CAPTCHA detected! \n${episodeUrl}\nPlease solve it and click OK.`);
                 if (!userConfirmed) { failedEpisodes++; continue; }
                 result = await fetchNovelContent(episodeUrl);
@@ -333,7 +385,6 @@ async function downloadNovel(title, episodeLinks, startEpisode, endEpisode, dela
             
             progressBar.style.width = `${stats.progress}%`;
             progressText.textContent = `${stats.progress}%`;
-            // [Modified to English]
             timeRemaining.textContent = `Time remaining: ${stats.remaining}`;
             detailedProgress.innerHTML = `
                 <div style="margin-bottom: 4px; display: flex; justify-content: center; gap: 12px;">
@@ -345,7 +396,6 @@ async function downloadNovel(title, episodeLinks, startEpisode, endEpisode, dela
             await new Promise(r => setTimeout(r, delayMs));
         }
 
-        // [Modified to English]
         statusElement.textContent = '✅ Completed!';
         progressBar.style.width = '100%';
         progressText.textContent = '100%';
@@ -397,14 +447,12 @@ async function fetchPage(url) {
 
 async function runCrawler() {
     if (!window.location.pathname.includes('/novel/')) {
-        // [Modified to English]
         alert('This script must be executed on the novel listing page.');
         return;
     }
 
     const title = extractTitle();
     if (!title) {
-        // [Modified to English]
         alert('Failed to extract the novel title.');
         return;
     }
@@ -422,7 +470,6 @@ async function runCrawler() {
         width: '400px', maxWidth: '90%', padding: '24px', animation: 'fadeIn 0.3s'
     });
 
-    // [Modified to English]
     const dialogTitle = document.createElement('h3');
     dialogTitle.textContent = `"${title}" Settings`;
     Object.assign(dialogTitle.style, { margin: '0 0 20px 0', color: '#172238', fontSize: '18px', fontWeight: '600' });
@@ -452,14 +499,12 @@ async function runCrawler() {
         return { group, input };
     }
 
-    // [Modified to English]
     const pagesInput = createInputGroup('Number of List Pages', 'number', '1', '', 'If all episodes are loaded on one page, keep it as 1.');
     dialogContent.appendChild(pagesInput.group);
 
     const buttonsContainer = document.createElement('div');
     Object.assign(buttonsContainer.style, { display: 'flex', justifyContent: 'space-between', marginTop: '16px', gap: '12px' });
 
-    // [Modified to English]
     const cancelButton = document.createElement('button');
     cancelButton.textContent = 'Cancel';
     Object.assign(cancelButton.style, {
@@ -468,7 +513,6 @@ async function runCrawler() {
     cancelButton.onclick = () => document.body.removeChild(dialog);
     buttonsContainer.appendChild(cancelButton);
 
-    // [Modified to English]
     const continueButton = document.createElement('button');
     continueButton.textContent = 'Continue';
     Object.assign(continueButton.style, {
@@ -489,7 +533,6 @@ async function runCrawler() {
         });
         const loadingContent = document.createElement('div');
         Object.assign(loadingContent.style, { backgroundColor: '#fff', borderRadius: '12px', width: '300px', padding: '24px', textAlign: 'center' });
-        // [Modified to English]
         const loadingText = document.createElement('p');
         loadingText.textContent = 'Loading episode list...';
         loadingContent.appendChild(loadingText);
@@ -500,7 +543,6 @@ async function runCrawler() {
         document.body.removeChild(loadingDialog);
 
         if (allEpisodeLinks.length === 0) {
-            // [Modified to English]
             alert('Failed to fetch the episode list. Please check the page structure.');
             return;
         }
@@ -515,7 +557,6 @@ async function runCrawler() {
         const rangeContent = document.createElement('div');
         Object.assign(rangeContent.style, { backgroundColor: '#fff', borderRadius: '12px', width: '400px', padding: '24px' });
 
-        // [Modified to English]
         const rangeTitle = document.createElement('h3');
         rangeTitle.textContent = 'Configure Download Range';
         rangeContent.appendChild(rangeTitle);
@@ -524,7 +565,6 @@ async function runCrawler() {
         episodeCount.innerHTML = `<span style="background-color: #ebf5ff; color: #3a7bd5; padding: 4px 8px; border-radius: 4px;">Total ${allEpisodeLinks.length} Episodes</span>`;
         rangeContent.appendChild(episodeCount);
 
-        // [Modified to English]
         const startInput = createInputGroup('Start Episode', 'number', '1', '');
         rangeContent.appendChild(startInput.group);
 
@@ -537,13 +577,11 @@ async function runCrawler() {
         const rangeButtons = document.createElement('div');
         Object.assign(rangeButtons.style, { display: 'flex', justifyContent: 'space-between', marginTop: '20px', gap: '12px' });
 
-        // [Modified to English]
         const rangeCancelButton = document.createElement('button');
         rangeCancelButton.textContent = 'Cancel';
         rangeCancelButton.onclick = () => document.body.removeChild(rangeDialog);
         rangeButtons.appendChild(rangeCancelButton);
 
-        // [Modified to English]
         const downloadButton = document.createElement('button');
         downloadButton.textContent = 'Download';
         rangeButtons.appendChild(downloadButton);
@@ -557,7 +595,6 @@ async function runCrawler() {
             const delay = parseInt(delayInput.input.value, 10);
 
             if (isNaN(startEpisode) || isNaN(endEpisode) || startEpisode < 1 || endEpisode < startEpisode || endEpisode > allEpisodeLinks.length) {
-                // [Modified to English]
                 alert('Please enter a valid episode range.');
                 return;
             }
