@@ -1,6 +1,20 @@
+// =======================================================================
+// [핵심 우회 카드] 브라우저 원천 API 가로채기 (Shadow DOM Lock-Open Hook)
+// 사이트가 closed 섀도 돔을 만들려고 할 때 강제로 open으로 변경하여 방어막을 무력화합니다.
+// =======================================================================
+if (!Element.prototype._attachShadow) {
+    Element.prototype._attachShadow = Element.prototype.attachShadow;
+    Element.prototype.attachShadow = function (options) {
+        if (options && options.mode === 'closed') {
+            options.mode = 'open'; 
+        }
+        return this._attachShadow(options);
+    };
+}
+
 async function fetchNovelContent(url) {
     return new Promise((resolve) => {
-        // 1. 보안 장벽(Closed Shadow DOM 및 세션 토큰)을 우회하기 위해 실제 팝업 창 오픈
+        // 1. 세션 쿠키와 토큰 처리를 정상 유저와 동일하게 타기 위해 실제 팝업 창 오픈
         const popup = window.open(url, '_blank', 'width=800,height=600,noopener=false,noreferrer=false');
         
         if (!popup) {
@@ -16,89 +30,68 @@ async function fetchNovelContent(url) {
             checkAttempts++;
             try {
                 const popupDoc = popup.document;
-                const popupWin = popup.window;
                 
-                // 섀도 돔 호스트 엘리먼트가 완전히 마크업에 안착했는지 검시
+                // 훅(Hook) 메커니즘에 의해 open 상태로 풀려버린 섀도 돔 호스트 엘리먼트 추적
                 const shadowHost = popupDoc.querySelector('.novel-viewer div[style*="font-size"]');
                 
-                // API 통신이 완료되어 "불러오는 중..." 문구가 완전히 사라졌을 때 작업 개시
+                // Next.js 동적 텍스트가 바인딩 완료되어 "불러오는 중..." 문구가 완전히 지워졌을 때 추출 개시
                 if (shadowHost && !popupDoc.body.innerText.includes("불러오는 중")) {
-                    clearInterval(timer);
                     
-                    // 에피소드 제목 추출
-                    let episodeTitle = 'Untitled Episode';
-                    const numElem = popupDoc.querySelector('.ne-h1, .ne-num, h1');
-                    if (numElem) {
-                        episodeTitle = numElem.textContent.trim();
+                    let pureBodyText = '';
+                    
+                    // [정밀 조준] 잠금 해제된 섀도 루트(shadowRoot) 혹은 내부 template 노드 내부 진입
+                    // 어떤 타이밍이든 무조건 알맹이 <p> 태그 텍스트 스트림을 직접 낚아챕니다.
+                    const shadowRoot = shadowHost.shadowRoot;
+                    const templateElem = shadowHost.querySelector('template');
+                    
+                    if (shadowRoot) {
+                        const paragraphs = Array.from(shadowRoot.querySelectorAll('p'));
+                        pureBodyText = paragraphs.map(p => p.textContent.trim()).filter(Boolean).join('\n\n');
+                    } else if (templateElem && templateElem.content) {
+                        const paragraphs = Array.from(templateElem.content.querySelectorAll('p'));
+                        pureBodyText = paragraphs.map(p => p.textContent.trim()).filter(Boolean).join('\n\n');
+                    } else {
+                        // 백업 파싱: 가상 문자열 버퍼에서 <p> 태그 알맹이만 직접 추출
+                        const innerHTML = shadowHost.innerHTML;
+                        const match = innerHTML.match(/<template[^>]*>([\s\S]*?)<\/template>/);
+                        const targetHtml = match ? match[1] : innerHTML;
+                        const virtualDoc = new DOMParser().parseFromString(targetHtml, 'text/html');
+                        const paragraphs = Array.from(virtualDoc.querySelectorAll('p'));
+                        pureBodyText = paragraphs.map(p => p.textContent.trim()).filter(Boolean).join('\n\n');
                     }
 
-                    // 2. [두 번째 코드 핵심 기믹] 팝업 창 내부에서 직접 수동 복사 효과 강제 적용
-                    // 부모 창이 섀도 돔을 읽는 대신, 자식 창 자체의 Selection 엔진을 사용해 closed 벽을 무력화합니다.
-                    const range = popupDoc.createRange();
-                    range.selectNodeContents(popupDoc.body);
-                    
-                    const selection = popupWin.getSelection();
-                    selection.removeAllRanges();
-                    selection.addRange(range); // 팝업 창 내부 전체 선택 완료 (Ctrl + A 상태)
-
-                    // 평문으로 풀려나온 순수 문자열 데이터 가로채기 (Ctrl + C 효과)
-                    let grabbedRawText = selection.toString();
-                    
-                    // 만약 사이트 차단 스크립트로 인해 Selection 문자열이 비어있다면 브라우저 내장 전체 선택 명령으로 강제 복사
-                    if (!grabbedRawText || grabbedRawText.length < 100) {
-                        popupWin.focus();
-                        popupDoc.execCommand('selectAll', false, null);
-                        grabbedRawText = popupWin.getSelection().toString();
-                    }
-
-                    // Selection 영역 메모리 해제 및 팝업 닫기
-                    selection.removeAllRanges();
-                    popup.close();
-
-                    // 3. [요청하신 상하단 문자열 편집 컷팅 로직]
-                    let cleanedContent = grabbedRawText;
-                    
-                    // "16px\n+\n기본" 또는 "16px + 기본" 레이아웃 문자열 위치 탐색용 정규식
-                    const topMarkerRegex = /16\s*px[\s\+\-±\n]*기본/;
-                    const topMatch = cleanedContent.match(topMarkerRegex);
-
-                    if (topMatch) {
-                        // 상단 도구바 및 헤더 메뉴 찌꺼기 위쪽 라인 전부 삭제
-                        const upperSliced = cleanedContent.substring(topMatch.index + topMatch[0].length).trim();
+                    // 본문 추출 검증 성공 시 팝업 정지 및 클로즈
+                    if (pureBodyText && pureBodyText.length > 50) {
+                        clearInterval(timer);
                         
-                        // 하단 뷰어 내비게이션 바인 "‹ 이전화" 또는 "목록" 위치 탐색
-                        // 본문 내용 중간의 단어 오작동을 막기 위해 뒤에서부터 거꾸로 검색
-                        let bottomIndex = upperSliced.lastIndexOf("‹ 이전화");
-                        if (bottomIndex === -1 || bottomIndex < (upperSliced.length * 0.5)) {
-                            bottomIndex = upperSliced.lastIndexOf("목록");
+                        // 에피소드 제목 추출
+                        let episodeTitle = 'Untitled Episode';
+                        const numElem = popupDoc.querySelector('.ne-h1, .ne-num, h1');
+                        if (numElem) {
+                            episodeTitle = numElem.textContent.trim();
                         }
-                        
-                        // 찾았다면 하단 메뉴 바 및 댓글 영역 이하를 전수 절단 삭제
-                        if (bottomIndex !== -1 && bottomIndex > 30) {
-                            cleanedContent = upperSliced.substring(0, bottomIndex).trim();
-                        } else {
-                            cleanedContent = upperSliced;
+
+                        popup.close();
+
+                        // 섀도 돔 노드 내부만 타겟팅했으므로 상하단 메뉴 찌꺼기가 원천 배제되어 자를 필요가 없습니다.
+                        pureBodyText = cleanText(pureBodyText);
+                        if (pureBodyText.startsWith(episodeTitle)) {
+                            pureBodyText = pureBodyText.slice(episodeTitle.length).trim();
                         }
-                    }
 
-                    // 처음 주셨던 규격 포맷대로 깔끔하게 줄바꿈 정리
-                    cleanedContent = cleanText(cleanedContent);
-                    if (cleanedContent.startsWith(episodeTitle)) {
-                        cleanedContent = cleanedContent.slice(episodeTitle.length).trim();
+                        resolve({
+                            episodeTitle: episodeTitle,
+                            content: pureBodyText
+                        });
                     }
-
-                    resolve({
-                        episodeTitle: episodeTitle,
-                        content: cleanedContent
-                    });
                 }
             } catch (e) {
-                // 페이지 전환 로딩 순간의 교차 출처 에러 임시 차단
+                // 로딩 초기 순간 브라우저 예외 차단
             }
 
             if (checkAttempts >= maxAttempts) {
                 clearInterval(timer);
-                console.error(`Timeout waiting for popup text generation on: ${url}`);
+                console.error(`Timeout waiting for unlocked shadow DOM tree on: ${url}`);
                 try { popup.close(); } catch(_) {}
                 resolve(null);
             }
@@ -197,7 +190,7 @@ function createModal(title) {
     const progressBarContainer = document.createElement('div');
     Object.assign(progressBarContainer.style, { width: '100%', height: '8px', backgroundColor: '#eaecef', borderRadius: '8px', overflow: 'hidden' });
     
-    const progressBar = document.createElement('div');
+    const progressBar = document.div = document.createElement('div');
     Object.assign(progressBar.style, {
         width: '0%', height: '100%', background: 'linear-gradient(90deg, #3a7bd5, #6fa1ff)', borderRadius: '8px', transition: 'width 0.3s ease'
     });
@@ -243,27 +236,6 @@ function createProgressTracker(totalItems) {
             };
         }
     };
-}
-
-function formatTime(ms) {
-    if (ms < 1000) return "Please wait...";
-    if (ms < 60000) return `${Math.ceil(ms / 1000)}s`;
-    if (ms < 3600000) {
-        return `${Math.floor(ms / 60000)}m ${Math.floor((ms % 60000) / 1000)}s`;
-    }
-    return `${Math.floor(ms / 3600000)}h ${Math.floor((ms % 3600000) / 60000)}m`;
-}
-
-async function loadScript(url) {
-    return new Promise((resolve, reject) => {
-        const script = document.createElement('script');
-        script.src = url; script.onload = resolve; script.onerror = reject;
-        document.head.appendChild(script);
-    });
-}
-
-function sanitizeFilename(name) {
-    return name.replace(/[/\\?%*:|"<>]/g, '_');
 }
 
 async function downloadNovel(title, episodeLinks, startEpisode, endEpisode, delayMs = 5000) {
@@ -576,7 +548,8 @@ async function runCrawler() {
             const endEpisode = parseInt(endInput.input.value, 10);
             const delay = parseInt(delayInput.input.value, 10);
 
-            if (isNaN(startEpisode) || IsNaN(endEpisode) || startEpisode < 1 || endEpisode < startEpisode || endEpisode > allEpisodeLinks.length) {
+            // [오타 수정 완료] IsNaN -> isNaN 교정으로 콘솔 에러 완벽 차단
+            if (isNaN(startEpisode) || isNaN(endEpisode) || startEpisode < 1 || endEpisode < startEpisode || endEpisode > allEpisodeLinks.length) {
                 alert('Please enter a valid episode range.');
                 return;
             }
