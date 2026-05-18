@@ -40,13 +40,13 @@ async function fetchNovelContent(url) {
         
         // 에피소드 제목 추출
         let episodeTitle = 'Untitled Episode';
-        const numElem = doc.querySelector('.ne-num, .ne-title, h1, .ne-h1');
+        const numElem = doc.querySelector('.ne-num, .ne-title, h1, .ne-h1, title');
         if (numElem) {
-            episodeTitle = numElem.textContent.trim();
+            episodeTitle = numElem.textContent.trim().split('|')[0].trim();
         }
 
-        // 잠금이 강제로 해제된 섀도 돔 호스트 엘리먼트 조준
-        const shadowHost = doc.querySelector('.novel-viewer div[style*="font-size"]');
+        // 잠금이 강제로 해제된 섀도 돔 호스트 엘리먼트 조준 (더욱 유연하고 견고한 셀렉터 적용)
+        const shadowHost = doc.querySelector('.novel-viewer div[style*="font-size"], .novel-viewer div, article div');
         let cleanedContent = '';
 
         if (shadowHost && shadowHost.shadowRoot) {
@@ -54,11 +54,17 @@ async function fetchNovelContent(url) {
             const paragraphs = Array.from(shadowHost.shadowRoot.querySelectorAll('p'));
             cleanedContent = paragraphs.map(p => p.textContent.trim()).filter(Boolean).join('\n\n');
         } else {
-            // Fallback: 혹시라도 섀도 돔 조립 전에 템플릿 태그가 남아있다면 직접 탐색 수집
+            // Fallback 1: 혹시라도 섀도 돔 조립 전에 템플릿 태그가 남아있다면 직접 탐색 수집
             const templateElem = doc.querySelector('.novel-viewer template');
             if (templateElem && templateElem.content) {
                 const paragraphs = Array.from(templateElem.content.querySelectorAll('p'));
                 cleanedContent = paragraphs.map(p => p.textContent.trim()).filter(Boolean).join('\n\n');
+            } else {
+                // Fallback 2: 템플릿 영역 밖으로 이미 노출되어 파싱된 문장 수집 시도
+                const paragraphs = Array.from(doc.querySelectorAll('.novel-viewer p, article p'));
+                if (paragraphs.length > 0) {
+                    cleanedContent = paragraphs.map(p => p.textContent.trim()).filter(Boolean).join('\n\n');
+                }
             }
         }
 
@@ -143,11 +149,18 @@ function createModal(title) {
     header.appendChild(headerTitle);
     
     const closeButton = document.createElement('button');
+    closeButton.type = 'button';
     closeButton.innerHTML = '&times;';
     Object.assign(closeButton.style, {
         background: 'none', border: 'none', fontSize: '22px', cursor: 'pointer', color: '#666', padding: '0 4px', lineHeight: '1'
     });
-    closeButton.onclick = () => { if (confirm('Do you want to cancel the download?')) { document.body.removeChild(modal); } };
+    closeButton.onclick = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (confirm('Do you want to cancel the download?')) {
+            document.body.removeChild(modal);
+        }
+    };
     header.appendChild(closeButton);
     modalContent.appendChild(header);
 
@@ -275,7 +288,9 @@ async function downloadNovel(title, episodeLinks, startEpisode, endEpisode, dela
             <div style="font-weight: 600; color: #172238; margin-bottom: 4px;">${text}</div>
             <div style="font-size: 13px; color: #666;">${description}</div>
         `;
-        option.onclick = () => {
+        option.onclick = (e) => {
+            e.preventDefault();
+            e.stopPropagation();
             document.body.removeChild(dialog);
             processDownload(value === '1' ? false : true);
         };
@@ -289,12 +304,17 @@ async function downloadNovel(title, episodeLinks, startEpisode, endEpisode, dela
     dialogContent.appendChild(optionsContainer);
     
     const cancelButton = document.createElement('button');
+    cancelButton.type = 'button';
     cancelButton.textContent = 'Cancel';
     Object.assign(cancelButton.style, {
         width: '100%', padding: '10px', border: '1px solid #e4e9f0', borderRadius: '8px',
         backgroundColor: '#f9f9fb', cursor: 'pointer', fontSize: '14px', fontWeight: '500'
     });
-    cancelButton.onclick = () => document.body.removeChild(dialog);
+    cancelButton.onclick = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        document.body.removeChild(dialog);
+    };
     dialogContent.appendChild(cancelButton);
     dialog.appendChild(dialogContent);
     document.body.appendChild(dialog);
@@ -374,7 +394,7 @@ async function downloadNovel(title, episodeLinks, startEpisode, endEpisode, dela
         progressText.textContent = '100%';
         
         setTimeout(() => {
-            document.body.removeChild(modal);
+            try { document.body.removeChild(modal); } catch(e) {}
             if (saveAsZip) {
                 zip.generateAsync({type: 'blob'}).then(blob => {
                     const a = document.createElement('a');
@@ -465,14 +485,20 @@ async function runCrawler() {
     Object.assign(buttonsContainer.style, { display: 'flex', justifyContent: 'space-between', marginTop: '16px', gap: '12px' });
 
     const cancelButton = document.createElement('button');
+    cancelButton.type = 'button';
     cancelButton.textContent = 'Cancel';
     Object.assign(cancelButton.style, {
         flex: '1', padding: '10px', border: '1px solid #e4e9f0', borderRadius: '8px', backgroundColor: '#f9f9fb', cursor: 'pointer'
     });
-    cancelButton.onclick = () => document.body.removeChild(dialog);
+    cancelButton.onclick = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        document.body.removeChild(dialog);
+    };
     buttonsContainer.appendChild(cancelButton);
 
     const continueButton = document.createElement('button');
+    continueButton.type = 'button';
     continueButton.textContent = 'Continue';
     Object.assign(continueButton.style, {
         flex: '1', padding: '10px', border: 'none', borderRadius: '8px', backgroundColor: '#3a7bd5', color: 'white', cursor: 'pointer'
@@ -482,7 +508,9 @@ async function runCrawler() {
     dialog.appendChild(dialogContent);
     document.body.appendChild(dialog);
 
-    continueButton.onclick = async () => {
+    continueButton.onclick = async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
         document.body.removeChild(dialog);
 
         const loadingDialog = document.createElement('div');
@@ -499,7 +527,7 @@ async function runCrawler() {
         document.body.appendChild(loadingDialog);
 
         const allEpisodeLinks = extractEpisodeLinks();
-        document.body.removeChild(loadingDialog);
+        try { document.body.removeChild(loadingDialog); } catch(err) {}
 
         if (allEpisodeLinks.length === 0) {
             alert('Failed to fetch the episode list. Please check the page structure.');
@@ -537,23 +565,30 @@ async function runCrawler() {
         Object.assign(rangeButtons.style, { display: 'flex', justifyContent: 'space-between', marginTop: '20px', gap: '12px' });
 
         const rangeCancelButton = document.createElement('button');
+        rangeCancelButton.type = 'button';
         rangeCancelButton.textContent = 'Cancel';
-        rangeCancelButton.onclick = () => document.body.removeChild(rangeDialog);
+        rangeCancelButton.onclick = (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            document.body.removeChild(rangeDialog);
+        };
         rangeButtons.appendChild(rangeCancelButton);
 
         const downloadButton = document.createElement('button');
+        downloadButton.type = 'button';
         downloadButton.textContent = 'Download';
         rangeButtons.appendChild(downloadButton);
         rangeContent.appendChild(rangeButtons);
         rangeDialog.appendChild(rangeContent);
         document.body.appendChild(rangeDialog);
 
-        downloadButton.onclick = () => {
+        downloadButton.onclick = (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
             const startEpisode = parseInt(startInput.input.value, 10);
             const endEpisode = parseInt(endInput.input.value, 10);
             const delay = parseInt(delayInput.input.value, 10);
 
-            // [오타 수정 완료] isNaN으로 철저히 보정하여 ReferenceError를 원천 차단했습니다.
             if (isNaN(startEpisode) || isNaN(endEpisode) || startEpisode < 1 || endEpisode < startEpisode || endEpisode > allEpisodeLinks.length) {
                 alert('Please enter a valid episode range.');
                 return;
