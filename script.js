@@ -1,104 +1,129 @@
 async function fetchNovelContent(url) {
-    return new Promise((resolve) => {
-        // 1. 실제 사용자가 웹 브라우저로 보는 것과 동일한 환경을 만들기 위해 가상 iframe 생성
-        const iframe = document.createElement('iframe');
-        iframe.style.display = 'none';
-        iframe.src = url;
-        document.body.appendChild(iframe);
+    const response = await fetch(url);
 
-        iframe.onload = async () => {
+    if (!response.ok) {
+        console.error(`Failed to fetch content from ${url}. Status: ${response.status}`);
+        return null;
+    }
+
+    const html = await response.text();
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, 'text/html');
+    
+    // Extract episode title
+    let episodeTitle = 'Untitled Episode';
+    const numElem = doc.querySelector('.ne-h1, .ne-num, h1');
+    if (numElem) {
+        episodeTitle = numElem.textContent.trim();
+    }
+
+    let cleanedContent = '';
+
+    // [우회 1순위] Next.js Hydration 스트리밍 데이터 구조 역추적 및 내부 데이터 파싱
+    const scripts = Array.from(doc.querySelectorAll('script'));
+    for (const script of scripts) {
+        const text = script.textContent;
+        // Next.js가 데이터를 클라이언트에 실어 보낼 때 사용하는 고유 데이터 스트림 규칙 파싱
+        if (text.includes('__next_f') && (text.includes('화') || text.includes('마법') || text.includes('투란'))) {
+            const stringMatches = text.match(/"([^"]{150,})"/g);
+            if (stringMatches) {
+                let longestChunk = '';
+                stringMatches.forEach(m => {
+                    try {
+                        const parsed = JSON.parse(m);
+                        // HTML 태그가 아니면서 소설 본문 조건(긴 한글 문장)을 충족하는 문자열 선별
+                        if (parsed && parsed.length > longestChunk.length && !parsed.includes('<html')) {
+                            longestChunk = parsed;
+                        }
+                    } catch(_) {}
+                });
+                if (longestChunk) {
+                    cleanedContent = cleanText(longestChunk);
+                    if (cleanedContent.length > 100) break;
+                }
+            }
+        }
+    }
+
+    // [우회 2순위] API 통신용 숨겨진 데이터 토큰(data-token)을 가로채서 백업 조립
+    if (!cleanedContent) {
+        const viewerElem = doc.querySelector('div[data-token]');
+        if (viewerElem) {
+            const token = viewerElem.getAttribute('data-token');
+            const novelId = viewerElem.getAttribute('novelId') || url.split('/')[4];
+            const episodeId = viewerElem.getAttribute('episodeId') || url.split('/')[5];
+            
             try {
-                const iframeDoc = iframe.contentDocument || iframe.contentWindow.document;
-                
-                // Next.js 동적 스크립트가 실행되어 본문이 화면에 완전히 그려질 때까지 700ms 대기
-                await new Promise(r => setTimeout(r, 700));
-
-                // 에피소드 제목 추출
-                let episodeTitle = 'Untitled Episode';
-                const numElem = iframeDoc.querySelector('.ne-h1, .ne-num, h1');
-                if (numElem) {
-                    episodeTitle = numElem.textContent.trim();
-                }
-
-                // 2. [Ctrl + A] 후 복사하는 것과 동일하게 화면에 렌더링된 전체 텍스트(innerText) 가로채기
-                // 복사 방지 스크립트가 작동 중이어도 브라우저 내부 런타임 텍스트는 무조건 잡힙니다.
-                const fullText = iframeDoc.body.innerText;
-
-                // 3. [텍스트 자르기 로직 적용]
-                let cleanedContent = '';
-                
-                // "16px\n+\n기본" 또는 "16px + 기본" 형태로 렌더링되는 기준점 탐색
-                // 다양한 줄바꿈 공백 리터럴을 방어하기 위해 정규식 패턴 사용
-                const topMarkerRegex = /16\s*px\s*[\-\+±]?\s*기본/;
-                const topMatch = fullText.match(topMarkerRegex);
-
-                if (topMatch) {
-                    // 상단 기준점 위쪽(불필요한 헤더 및 유틸 메뉴) 제거
-                    const uppercaseSlice = fullText.substring(topMatch.index + topMatch[0].length);
-                    
-                    // 하단 기준점 "‹ 이전화\n목록\n다음화 ›" 또는 "목록\n다음화 ›" 탐색하여 잘라내기
-                    const bottomMarker = "목록";
-                    const bottomIndex = uppercaseSlice.indexOf(bottomMarker);
-                    
-                    if (bottomIndex !== -1) {
-                        cleanedContent = uppercaseSlice.substring(0, bottomIndex).trim();
-                    } else {
-                        // 목록 글자를 못 찾았을 경우 "댓글" 선에서 차단하는 예외 방어코드
-                        const commentIndex = uppercaseSlice.indexOf("댓글");
-                        cleanedContent = commentIndex !== -1 ? uppercaseSlice.substring(0, commentIndex).trim() : uppercaseSlice.trim();
+                // 사이트 내부에서 본문을 비동기로 호출하는 실제 API 주소를 다이렉트로 추적
+                const apiRes = await fetch(`/api/novel/viewer?novelId=${novelId}&episodeId=${episodeId}&token=${encodeURIComponent(token)}`);
+                if (apiRes.ok) {
+                    const apiData = await apiRes.json();
+                    if (apiData && apiData.content) {
+                        cleanedContent = cleanText(apiData.content);
                     }
-                }
-
-                // 가상 창 메모리 해제
-                document.body.removeChild(iframe);
-
-                // 상하단 정제기가 정상 작동했는지 텍스트 유효성 검증
-                if (!cleanedContent || cleanedContent.includes("불러오는 중") || cleanedContent.length < 30) {
-                    console.error(`Failed to slice pure content properly from URL: ${url}`);
-                    resolve(null);
-                } else {
-                    // 최종 본문 텍스트 규격화 정돈 후 반환
-                    cleanedContent = cleanText(cleanedContent);
-                    if (cleanedContent.startsWith(episodeTitle)) {
-                        cleanedContent = cleanedContent.slice(episodeTitle.length).trim();
-                    }
-                    resolve({
-                        episodeTitle: episodeTitle,
-                        content: cleanedContent
-                    });
                 }
             } catch (e) {
-                console.error(`Error context processing inside iframe for ${url}:`, e);
-                try { document.body.removeChild(iframe); } catch(_) {}
-                resolve(null);
+                console.error("API backend tracking failed:", e);
             }
-        };
-    });
+        }
+    }
+
+    // 최후의 방어코드: 일반 DOM 객체 내부 파싱 시도
+    if (!cleanedContent) {
+        const contentContainer = doc.querySelector('.novel-viewer, article, .view-content, #novel_content');
+        if (contentContainer) {
+            cleanedContent = cleanText(contentContainer.innerHTML);
+        }
+    }
+
+    // 완전히 빈 껍데기 로딩 안내문만 긁어온 경우는 에러로 간주하여 처리 차단
+    if (!cleanedContent || cleanedContent.includes("불러오는 중") || cleanedContent.length < 50) {
+        console.error(`Failed to bypass protections or find content on: ${url}`);
+        return null;
+    }
+
+    if (cleanedContent.startsWith(episodeTitle)) {
+        cleanedContent = cleanedContent.slice(episodeTitle.length).trim();
+    }
+
+    return {
+        episodeTitle: episodeTitle,
+        content: cleanedContent
+    };
 }
 
 function unescapeHTML(text) {
     const entities = {
         '&lt;': '<', '&gt;': '>', '&amp;': '&', '&quot;': '"', '&apos;': "'",
         '&nbsp;': ' ', '&ndash;': '-', '&mdash;': '--', '&lsquo;': "'",
-        '&raquo;': "'", '&ldquo;': '"', '&rdquo;': '"'
+        '&rsquo;': "'", '&ldquo;': '"', '&rdquo;': '"'
     };
-
     Object.entries(entities).forEach(([entity, replacement]) => {
         const regex = new RegExp(entity, 'g');
         text = text.replace(regex, replacement);
     });
-
     return text;
 }
 
 function cleanText(text) {
+    text = text.replace(/<div>/g, '');
+    text = text.replace(/<\/div>/g, '');
+    text = text.replace(/<p>/g, '\n');
+    text = text.replace(/<\/p>/g, '\n');
+    text = text.replace(/<br\s*[/]?>/g, '\n');
+    text = text.replace(/<img[^>]*>/gi, '[skipped image]');
+    text = text.replace(/<[^>]*>/g, '');
+    text = text.replace(/ {2,}/g, ' ');
     text = unescapeHTML(text);
-    return text
+
+    text = text
         .split('\n')
         .map(line => line.trim())
         .filter(line => line.length > 0)
         .join('\n\n')
         .replace(/\n{3,}/g, '\n\n');
+
+    return text;
 }
 
 function createModal(title) {
@@ -336,7 +361,7 @@ async function downloadNovel(title, episodeLinks, startEpisode, endEpisode, dela
             let result = await fetchNovelContent(episodeUrl);
             if (!result) {
                 captchaCount++;
-                const userConfirmed = confirm(`Bypass alert trigger! \n${episodeUrl}\nPlease maximize the window and ensure the page text has loaded properly on the back, then click OK.`);
+                const userConfirmed = confirm(`Bypass alert or CAPTCHA trigger! \n${episodeUrl}\nPlease make sure the tab is active, wait a moment, and click OK.`);
                 if (!userConfirmed) { failedEpisodes++; continue; }
                 result = await fetchNovelContent(episodeUrl);
                 if (!result) { failedEpisodes++; continue; }
@@ -404,14 +429,6 @@ function extractEpisodeLinks() {
     const links = document.querySelectorAll('.novel-eps li a');
     const episodeLinks = Array.from(links).map(link => link.getAttribute('href')).filter(Boolean);
     return episodeLinks.reverse();
-}
-
-async function fetchPage(url) {
-    const response = await fetch(url);
-    if (!response.ok) return null;
-    const html = await response.text();
-    const parser = new DOMParser();
-    return parser.parseFromString(html, 'text/html');
 }
 
 async function runCrawler() {
