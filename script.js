@@ -548,7 +548,7 @@ async function downloadNovel(title, episodeLinks, startEpisode, endEpisode, dela
         
         for (let i = startingIndex; i >= endingIndex; i--) {
             const episodeUrl = episodeLinks[i];
-            if (!episodeUrl.startsWith('https://booktoki')) {
+            if (!episodeUrl.startsWith('https://sbxh1')) {
                 failedEpisodes++;
                 continue;
             }
@@ -849,7 +849,7 @@ async function fetchPage(url) {
 }
 
 async function runCrawler() {
-    const novelPageRule = 'https://booktoki';
+    const novelPageRule = 'https://sbxh1';
     let currentUrl = window.location.href;
 
     // Clean URL
