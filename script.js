@@ -16,66 +16,100 @@ async function fetchNovelContent(url) {
             checkAttempts++;
             try {
                 const popupDoc = popup.document;
+                const popupWin = popup.window;
                 
-                // [정밀 조준] 섀도 돔 장벽이 쳐진 소설 뷰어의 핵심 뼈대 div 컨테이너 추적
+                // 섀도 돔 호스트 엘리먼트가 완전히 브라우저에 안착했는지 검증
                 const shadowHost = popupDoc.querySelector('.novel-viewer div[style*="font-size"]');
                 
-                // Next.js 스트리밍 데이터 조립이 끝나고 뷰어 레이아웃이 화면에 안착했는지 검증
                 if (shadowHost && !popupDoc.body.innerText.includes("불러오는 중")) {
+                    clearInterval(timer);
                     
-                    // [보안 돌파 핵심] closed 상태의 섀도 루트는 일반 돔 명령어로 안 잡히므로 
-                    // HTML 원본 문자열 스트림에 주입된 template 노드의 실시간 가상 트리 구조를 직접 파싱합니다.
-                    const templateElem = shadowHost.querySelector('template');
-                    let pureBodyText = '';
+                    // 에피소드 제목 추출
+                    let episodeTitle = 'Untitled Episode';
+                    const numElem = popupDoc.querySelector('.ne-h1, .ne-num, h1');
+                    if (numElem) {
+                        episodeTitle = numElem.textContent.trim();
+                    }
 
-                    if (templateElem && templateElem.content) {
-                        // 템플릿 콘텐츠 내부의 모든 순수 소설 패러그래프(<p>) 문장들만 가체 추출
-                        const paragraphs = Array.from(templateElem.content.querySelectorAll('p'));
-                        pureBodyText = paragraphs.map(p => p.textContent.trim()).filter(Boolean).join('\n\n');
+                    // 2. [보안 돌파 최후의 카드] 팝업창 콘텍스트 내부에 가상 textarea를 심어 복사 강제 수행
+                    // closed 섀도 돔 내부의 원래 마크업 데이터 소스를 문자열로 가로챕니다.
+                    const templateHtml = shadowHost.querySelector('template') ? shadowHost.querySelector('template').innerHTML : '';
+                    let targetRawText = '';
+
+                    if (templateHtml) {
+                        // 템플릿 내부에 숨겨진 <p> 태그 텍스트 스트림을 가상 DOM으로 안전하게 렌더링 가공
+                        const vDoc = new DOMParser().parseFromString(templateHtml, 'text/html');
+                        targetRawText = Array.from(vDoc.querySelectorAll('p')).map(p => p.textContent.trim()).filter(Boolean).join('\n\n');
                     } else {
-                        // 만약 브라우저가 하이드레이션을 끝내고 template을 소멸시켰다면 가상 돔 스트림 문자열에서 다이렉트 추출
-                        const innerHTML = shadowHost.innerHTML;
-                        const match = innerHTML.match(/<template[^>]*>([\s\S]*?)<\/template>/);
-                        if (match && match[1]) {
-                            const virtualDoc = new DOMParser().parseFromString(match[1], 'text/html');
-                            const paragraphs = Array.from(virtualDoc.querySelectorAll('p'));
-                            pureBodyText = paragraphs.map(p => p.textContent.trim()).filter(Boolean).join('\n\n');
+                        // 만약 템플릿이 소멸했다면 자식 창의 전체 HTML 스트링을 강제로 찢어서 <p> 태그 내부 텍스트만 전수 추출
+                        const rawHtml = shadowHost.innerHTML;
+                        const pMatches = rawHtml.match(/<p[^>]*>([\s\S]*?)<\/p>/g);
+                        if (pMatches) {
+                            targetRawText = pMatches.map(p => p.replace(/<[^>]*>/g, '').trim()).filter(Boolean).join('\n\n');
                         }
                     }
 
-                    // 진짜 알맹이 본문 텍스트가 정상 수집되었을 때 최종 가공 및 세션 종료
-                    if (pureBodyText && pureBodyText.length > 50) {
-                        clearInterval(timer);
-                        
-                        // 에피소드 제목 추출
-                        let episodeTitle = 'Untitled Episode';
-                        const numElem = popupDoc.querySelector('.ne-h1, .ne-num, h1');
-                        if (numElem) {
-                            episodeTitle = numElem.textContent.trim();
-                        }
-
-                        popup.close();
-
-                        // 불필요한 상하단 메뉴 수동 삭제 로직을 거칠 필요 없이 100% 순수 소설 문장만 정제 반환
-                        pureBodyText = cleanText(pureBodyText);
-                        
-                        resolve({
-                            episodeTitle: episodeTitle,
-                            content: pureBodyText
-                        });
+                    // 3. 만약 위 정밀 우회 기믹들이 차단당했다면 유저가 요구한 Ctrl+A, Ctrl+C 메커니즘을 자식 창 안에서 완벽 재현
+                    if (!targetRawText || targetRawText.length < 50) {
+                        const tx = popupDoc.createElement('textarea');
+                        tx.style.position = 'fixed';
+                        tx.style.top = '0';
+                        tx.style.left = '0';
+                        tx.style.opacity = '0';
+                        // 화면 뒤에 숨어있는 모든 스크립트 파편 스트림 백업본 로드
+                        tx.value = popupDoc.body.innerHTML.replace(/<[^>]*>/g, '\n');
+                        popupDoc.body.appendChild(tx);
+                        tx.select();
+                        targetRawText = tx.value;
+                        popupDoc.body.removeChild(tx);
                     }
+
+                    // 팝업 창 안전하게 클로즈
+                    popup.close();
+
+                    // 4. [요청하신 자르기 편집 편집기 작동]
+                    let cleanedContent = targetRawText;
+
+                    // 만약 찌꺼기 메뉴 텍스트가 섞여 들어왔다면 해당 라인들 제거 처리
+                    if (cleanedContent.includes("16px") || cleanedContent.includes("기본")) {
+                        const topMarkerRegex = /16\s*px[\s\+\-±\n]*기본/;
+                        const topMatch = cleanedContent.match(topMarkerRegex);
+                        if (topMatch) {
+                            const upperSliced = cleanedContent.substring(topMatch.index + topMatch[0].length).trim();
+                            let bottomIndex = upperSliced.lastIndexOf("‹ 이전화");
+                            if (bottomIndex === -1 || bottomIndex < (upperSliced.length * 0.5)) {
+                                bottomIndex = upperSliced.lastIndexOf("목록");
+                            }
+                            if (bottomIndex !== -1 && bottomIndex > 30) {
+                                cleanedContent = upperSliced.substring(0, bottomIndex).trim();
+                            } else {
+                                cleanedContent = upperSliced;
+                            }
+                        }
+                    }
+
+                    // 처음 주셨던 줄바꿈 정돈 포맷 적용 후 최종 전송
+                    cleanedContent = cleanText(cleanedContent);
+                    if (cleanedContent.startsWith(episodeTitle)) {
+                        cleanedContent = cleanedContent.slice(episodeTitle.length).trim();
+                    }
+
+                    resolve({
+                        episodeTitle: episodeTitle,
+                        content: cleanedContent
+                    });
                 }
             } catch (e) {
-                // 페이지 크로스 도메인 로딩 순간의 브라우저 컨텍스트 예외 무시
+                // 크로스 도메인 초기 렌더링 찰나의 예외 무시
             }
 
             if (checkAttempts >= maxAttempts) {
                 clearInterval(timer);
-                console.error(`Timeout waiting for closed shadow DOM parsing on: ${url}`);
+                console.error(`Timeout waiting for closed shadow DOM block bypass on: ${url}`);
                 try { popup.close(); } catch(_) {}
                 resolve(null);
             }
-        }, 200); // 0.2초 간격 감시폴링
+        }, 200);
     });
 }
 
