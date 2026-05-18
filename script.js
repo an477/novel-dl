@@ -1,6 +1,6 @@
 async function fetchNovelContent(url) {
     return new Promise((resolve) => {
-        // 1. 보안 우회를 위해 실제 팝업 창 오픈
+        // 1. 보안 장벽(Closed Shadow DOM 및 세션 토큰)을 우회하기 위해 실제 팝업 창 오픈
         const popup = window.open(url, '_blank', 'width=800,height=600,noopener=false,noreferrer=false');
         
         if (!popup) {
@@ -16,13 +16,13 @@ async function fetchNovelContent(url) {
             checkAttempts++;
             try {
                 const popupDoc = popup.document;
+                const popupWin = popup.window;
                 
-                // [정밀 조준] 뉴토끼 소설 뷰어에서 진짜 소설 글자가 들어차는 핵심 본문 컨테이너 탐색
-                // 'div[style*="--novel-font-size"]' 및 '.novel-viewer' 내부의 실제 글방 영역을 타겟팅합니다.
-                const viewerTarget = popupDoc.querySelector('.novel-viewer div[style*="font-size"], .novel-viewer article, .novel-story');
+                // 섀도 돔 호스트 엘리먼트가 완전히 마크업에 안착했는지 검시
+                const shadowHost = popupDoc.querySelector('.novel-viewer div[style*="font-size"]');
                 
-                // 뼈대 메뉴가 아닌, 실제 소설 내용 텍스트가 렌더링되어 채워졌는지 검증
-                if (viewerTarget && viewerTarget.innerText.trim().length > 100 && !popupDoc.body.innerText.includes("불러오는 중")) {
+                // API 통신이 완료되어 "불러오는 중..." 문구가 완전히 사라졌을 때 작업 개시
+                if (shadowHost && !popupDoc.body.innerText.includes("불러오는 중")) {
                     clearInterval(timer);
                     
                     // 에피소드 제목 추출
@@ -32,34 +32,77 @@ async function fetchNovelContent(url) {
                         episodeTitle = numElem.textContent.trim();
                     }
 
-                    // 2. 불필요한 상하단 메뉴를 자를 필요 없이, 오직 진짜 본문 내용만 100% 순수 복사
-                    let pureContent = viewerTarget.innerText.trim();
-
-                    // 수집 즉시 팝업 창 차단 해제 및 종료
-                    popup.close();
+                    // 2. [두 번째 코드 핵심 기믹] 팝업 창 내부에서 직접 수동 복사 효과 강제 적용
+                    // 부모 창이 섀도 돔을 읽는 대신, 자식 창 자체의 Selection 엔진을 사용해 closed 벽을 무력화합니다.
+                    const range = popupDoc.createRange();
+                    range.selectNodeContents(popupDoc.body);
                     
-                    // 처음 주셨던 소설 텍스트 줄바꿈 규격 가공 처리 적용
-                    pureContent = cleanText(pureContent);
-                    if (pureContent.startsWith(episodeTitle)) {
-                        pureContent = pureContent.slice(episodeTitle.length).trim();
+                    const selection = popupWin.getSelection();
+                    selection.removeAllRanges();
+                    selection.addRange(range); // 팝업 창 내부 전체 선택 완료 (Ctrl + A 상태)
+
+                    // 평문으로 풀려나온 순수 문자열 데이터 가로채기 (Ctrl + C 효과)
+                    let grabbedRawText = selection.toString();
+                    
+                    // 만약 사이트 차단 스크립트로 인해 Selection 문자열이 비어있다면 브라우저 내장 전체 선택 명령으로 강제 복사
+                    if (!grabbedRawText || grabbedRawText.length < 100) {
+                        popupWin.focus();
+                        popupDoc.execCommand('selectAll', false, null);
+                        grabbedRawText = popupWin.getSelection().toString();
+                    }
+
+                    // Selection 영역 메모리 해제 및 팝업 닫기
+                    selection.removeAllRanges();
+                    popup.close();
+
+                    // 3. [요청하신 상하단 문자열 편집 컷팅 로직]
+                    let cleanedContent = grabbedRawText;
+                    
+                    // "16px\n+\n기본" 또는 "16px + 기본" 레이아웃 문자열 위치 탐색용 정규식
+                    const topMarkerRegex = /16\s*px[\s\+\-±\n]*기본/;
+                    const topMatch = cleanedContent.match(topMarkerRegex);
+
+                    if (topMatch) {
+                        // 상단 도구바 및 헤더 메뉴 찌꺼기 위쪽 라인 전부 삭제
+                        const upperSliced = cleanedContent.substring(topMatch.index + topMatch[0].length).trim();
+                        
+                        // 하단 뷰어 내비게이션 바인 "‹ 이전화" 또는 "목록" 위치 탐색
+                        // 본문 내용 중간의 단어 오작동을 막기 위해 뒤에서부터 거꾸로 검색
+                        let bottomIndex = upperSliced.lastIndexOf("‹ 이전화");
+                        if (bottomIndex === -1 || bottomIndex < (upperSliced.length * 0.5)) {
+                            bottomIndex = upperSliced.lastIndexOf("목록");
+                        }
+                        
+                        // 찾았다면 하단 메뉴 바 및 댓글 영역 이하를 전수 절단 삭제
+                        if (bottomIndex !== -1 && bottomIndex > 30) {
+                            cleanedContent = upperSliced.substring(0, bottomIndex).trim();
+                        } else {
+                            cleanedContent = upperSliced;
+                        }
+                    }
+
+                    // 처음 주셨던 규격 포맷대로 깔끔하게 줄바꿈 정리
+                    cleanedContent = cleanText(cleanedContent);
+                    if (cleanedContent.startsWith(episodeTitle)) {
+                        cleanedContent = cleanedContent.slice(episodeTitle.length).trim();
                     }
 
                     resolve({
                         episodeTitle: episodeTitle,
-                        content: pureContent
+                        content: cleanedContent
                     });
                 }
             } catch (e) {
-                // 로딩 중 크로스 도메인 예외 임시 방어
+                // 페이지 전환 로딩 순간의 교차 출처 에러 임시 차단
             }
 
             if (checkAttempts >= maxAttempts) {
                 clearInterval(timer);
-                console.error(`Timeout waiting for internal content rendering on: ${url}`);
+                console.error(`Timeout waiting for popup text generation on: ${url}`);
                 try { popup.close(); } catch(_) {}
                 resolve(null);
             }
-        }, 200); // 0.2초 간격 감시
+        }, 200);
     });
 }
 
@@ -75,7 +118,6 @@ function unescapeHTML(text) {
     return text;
 }
 
-// [처음 주신 가공 포맷 완벽 복원] 줄바꿈 가독성 및 공백 정돈 엔진
 function cleanText(text) {
     text = unescapeHTML(text);
     return text
@@ -201,6 +243,27 @@ function createProgressTracker(totalItems) {
             };
         }
     };
+}
+
+function formatTime(ms) {
+    if (ms < 1000) return "Please wait...";
+    if (ms < 60000) return `${Math.ceil(ms / 1000)}s`;
+    if (ms < 3600000) {
+        return `${Math.floor(ms / 60000)}m ${Math.floor((ms % 60000) / 1000)}s`;
+    }
+    return `${Math.floor(ms / 3600000)}h ${Math.floor((ms % 3600000) / 60000)}m`;
+}
+
+async function loadScript(url) {
+    return new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = url; script.onload = resolve; script.onerror = reject;
+        document.head.appendChild(script);
+    });
+}
+
+function sanitizeFilename(name) {
+    return name.replace(/[/\\?%*:|"<>]/g, '_');
 }
 
 async function downloadNovel(title, episodeLinks, startEpisode, endEpisode, delayMs = 5000) {
@@ -513,7 +576,7 @@ async function runCrawler() {
             const endEpisode = parseInt(endInput.input.value, 10);
             const delay = parseInt(delayInput.input.value, 10);
 
-            if (isNaN(startEpisode) || isNaN(endEpisode) || startEpisode < 1 || endEpisode < startEpisode || endEpisode > allEpisodeLinks.length) {
+            if (isNaN(startEpisode) || IsNaN(endEpisode) || startEpisode < 1 || endEpisode < startEpisode || endEpisode > allEpisodeLinks.length) {
                 alert('Please enter a valid episode range.');
                 return;
             }
