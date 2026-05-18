@@ -1,6 +1,6 @@
 async function fetchNovelContent(url) {
     return new Promise((resolve) => {
-        // 1. 실제 사용자와 똑같은 세션으로 접근하기 위해 새 팝업 창 오픈
+        // 1. 보안 우회를 위해 실제 팝업 창 오픈
         const popup = window.open(url, '_blank', 'width=800,height=600,noopener=false,noreferrer=false');
         
         if (!popup) {
@@ -10,20 +10,19 @@ async function fetchNovelContent(url) {
         }
 
         let checkAttempts = 0;
-        const maxAttempts = 50; // 최대 10초까지 본문 로딩 대기
+        const maxAttempts = 50; // 최대 10초 대기
         
-        // 0.2초마다 팝업창의 렌더링 상태를 감시하는 폴링 엔진
         const timer = setInterval(() => {
             checkAttempts++;
             try {
                 const popupDoc = popup.document;
                 
-                // 화면 전체 선택(Ctrl+A) 후 복사한 것과 동일한 텍스트 스트림 가로채기
-                const bodyText = popupDoc.body ? popupDoc.body.innerText : '';
+                // [정밀 조준] 뉴토끼 소설 뷰어에서 진짜 소설 글자가 들어차는 핵심 본문 컨테이너 탐색
+                // 'div[style*="--novel-font-size"]' 및 '.novel-viewer' 내부의 실제 글방 영역을 타겟팅합니다.
+                const viewerTarget = popupDoc.querySelector('.novel-viewer div[style*="font-size"], .novel-viewer article, .novel-story');
                 
-                // [핵심 변경] 소설 뷰어의 도구 메뉴("글자", "16px") 등이 화면에 렌더링되었고, 
-                // "불러오는 중" 레이아웃이 완전히 사라졌을 때 비로소 로딩 완료로 판단!
-                if (bodyText && bodyText.includes("글자") && !bodyText.includes("불러오는 중") && bodyText.length > 300) {
+                // 뼈대 메뉴가 아닌, 실제 소설 내용 텍스트가 렌더링되어 채워졌는지 검증
+                if (viewerTarget && viewerTarget.innerText.trim().length > 100 && !popupDoc.body.innerText.includes("불러오는 중")) {
                     clearInterval(timer);
                     
                     // 에피소드 제목 추출
@@ -33,57 +32,34 @@ async function fetchNovelContent(url) {
                         episodeTitle = numElem.textContent.trim();
                     }
 
-                    // 2. [텍스트 자르기 편집 로직 적용]
-                    let cleanedContent = '';
-                    
-                    // 상단 기준점 "16px\n+\n기본" 또는 "16px + 기본" 탐색
-                    const topMarkerRegex = /16\s*px\s*[\-\+±]?\s*기본/;
-                    const topMatch = bodyText.match(topMarkerRegex);
+                    // 2. 불필요한 상하단 메뉴를 자를 필요 없이, 오직 진짜 본문 내용만 100% 순수 복사
+                    let pureContent = viewerTarget.innerText.trim();
 
-                    if (topMatch) {
-                        // "기본" 글자 바로 다음 지점부터 텍스트 분할 (상단 메뉴 완벽 제거)
-                        const rawBodySlice = bodyText.substring(topMatch.index + topMatch[0].length);
-                        
-                        // 하단 기준점 "‹ 이전화\n목록\n다음화 ›" 가 들어가는 영역 커팅
-                        // 보통 내비게이션 바의 "목록" 텍스트를 기준으로 하단을 쳐냅니다.
-                        const bottomMarker = "목록";
-                        const bottomIndex = rawBodySlice.lastIndexOf(bottomMarker); // 본문 내부 단어 오작동 방지를 위해 뒤에서부터 탐색
-                        
-                        if (bottomIndex !== -1 && bottomIndex > (rawBodySlice.length * 0.6)) {
-                            cleanedContent = rawBodySlice.substring(0, bottomIndex).trim();
-                        } else {
-                            // "목록" 매칭 실패 시 댓글 가림막 선에서 최후 차단
-                            const commentIndex = rawBodySlice.lastIndexOf("댓글");
-                            cleanedContent = commentIndex !== -1 ? rawBodySlice.substring(0, commentIndex).trim() : rawBodySlice.trim();
-                        }
-                    }
-
-                    // 수집 완료 후 즉시 팝업 창을 닫아 리소스 확보
+                    // 수집 즉시 팝업 창 차단 해제 및 종료
                     popup.close();
                     
-                    // 정제된 최종 본문 텍스트 포맷팅 가공 후 반환
-                    cleanedContent = cleanText(cleanedContent);
-                    if (cleanedContent.startsWith(episodeTitle)) {
-                        cleanedContent = cleanedContent.slice(episodeTitle.length).trim();
+                    // 처음 주셨던 소설 텍스트 줄바꿈 규격 가공 처리 적용
+                    pureContent = cleanText(pureContent);
+                    if (pureContent.startsWith(episodeTitle)) {
+                        pureContent = pureContent.slice(episodeTitle.length).trim();
                     }
 
                     resolve({
                         episodeTitle: episodeTitle,
-                        content: cleanedContent
+                        content: pureContent
                     });
                 }
             } catch (e) {
-                // 크로스 도메인 로딩 순간의 일시적인 예외 에러 무시
+                // 로딩 중 크로스 도메인 예외 임시 방어
             }
 
-            // 본문이 끝까지 로딩되지 않을 경우 강제 탈출 보안 장치
             if (checkAttempts >= maxAttempts) {
                 clearInterval(timer);
-                console.error(`Timeout waiting for Next.js hydration on: ${url}`);
+                console.error(`Timeout waiting for internal content rendering on: ${url}`);
                 try { popup.close(); } catch(_) {}
                 resolve(null);
             }
-        }, 200);
+        }, 200); // 0.2초 간격 감시
     });
 }
 
@@ -99,6 +75,7 @@ function unescapeHTML(text) {
     return text;
 }
 
+// [처음 주신 가공 포맷 완벽 복원] 줄바꿈 가독성 및 공백 정돈 엔진
 function cleanText(text) {
     text = unescapeHTML(text);
     return text
@@ -349,7 +326,6 @@ async function downloadNovel(title, episodeLinks, startEpisode, endEpisode, dela
                 </div>
                 <div>Elapsed: ${stats.elapsed} | Speed: ${stats.speed} ep/s</div>
             `;
-            // 팝업창이 충분히 열리고 수집된 다음 완전히 꺼져야 하므로 딜레이를 6000ms(6초) 이상 주시는 것을 추천합니다.
             await new Promise(r => setTimeout(r, delayMs));
         }
 
@@ -514,7 +490,7 @@ async function runCrawler() {
         const endInput = createInputGroup('End Episode', 'number', allEpisodeLinks.length.toString(), '');
         rangeContent.appendChild(endInput.group);
         
-        const delayInput = createInputGroup('Delay (ms)', 'number', '6000', '', '⚠️ Recommended: Keep 6000ms+ (6s) for stable popup rendering.');
+        const delayInput = createInputGroup('Delay (ms)', 'number', '5000', '', '⚠️ Recommended: Keep 5000ms (5s) to avoid blocks.');
         rangeContent.appendChild(delayInput.group);
 
         const rangeButtons = document.createElement('div');
