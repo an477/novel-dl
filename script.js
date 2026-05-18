@@ -1,102 +1,86 @@
 // =======================================================================
-// [핵심 우회 카드] 브라우저 원천 API 가로채기 (Shadow DOM Lock-Open Hook)
-// 사이트가 closed 섀도 돔을 만들려고 할 때 강제로 open으로 변경하여 방어막을 무력화합니다.
+// [보안 우회 핵심] 브라우저 Declarative Shadow DOM 강제 잠금해제 엔진
+// 사이트가 closed형 섀도 돔을 선언하더라도 open형으로 전환하여 파싱되도록 우회합니다.
 // =======================================================================
 if (!Element.prototype._attachShadow) {
     Element.prototype._attachShadow = Element.prototype.attachShadow;
     Element.prototype.attachShadow = function (options) {
         if (options && options.mode === 'closed') {
-            options.mode = 'open'; 
+            options.mode = 'open'; // closed -> open 강제 변경
         }
         return this._attachShadow(options);
     };
 }
 
+// 기존에 생성되어 화면에 남아있던 쓰레기 다이얼로그 및 모달창을 완전 폭파 및 청소
+// (오타 버전의 옛날 버튼들이 계속 눌리는 고스트 버그 현상을 방지합니다)
+const cleanupOldGarbage = () => {
+    const oldDialogs = document.querySelectorAll('div[style*="rgba(0,0,0,0.5)"], #downloadProgressModal, #downloadProgressModal ~ div');
+    oldDialogs.forEach(el => {
+        try { el.remove(); } catch(e) {}
+    });
+};
+cleanupOldGarbage();
+
 async function fetchNovelContent(url) {
-    return new Promise((resolve) => {
-        // 1. 세션 쿠키와 토큰 처리를 정상 유저와 동일하게 타기 위해 실제 팝업 창 오픈
-        const popup = window.open(url, '_blank', 'width=800,height=600,noopener=false,noreferrer=false');
-        
-        if (!popup) {
-            alert("Popup blocker is active! Please allow popups for this site to download.");
-            resolve(null);
-            return;
+    try {
+        const response = await fetch(url);
+        if (!response.ok) {
+            console.error(`Failed to fetch content from ${url}. Status: ${response.status}`);
+            return null;
         }
 
-        let checkAttempts = 0;
-        const maxAttempts = 50; // 최대 10초 대기
+        let html = await response.text();
         
-        const timer = setInterval(() => {
-            checkAttempts++;
-            try {
-                const popupDoc = popup.document;
-                
-                // 훅(Hook) 메커니즘에 의해 open 상태로 풀려버린 섀도 돔 호스트 엘리먼트 추적
-                const shadowHost = popupDoc.querySelector('.novel-viewer div[style*="font-size"]');
-                
-                // Next.js 동적 텍스트가 바인딩 완료되어 "불러오는 중..." 문구가 완전히 지워졌을 때 추출 개시
-                if (shadowHost && !popupDoc.body.innerText.includes("불러오는 중")) {
-                    
-                    let pureBodyText = '';
-                    
-                    // [정밀 조준] 잠금 해제된 섀도 루트(shadowRoot) 혹은 내부 template 노드 내부 진입
-                    // 어떤 타이밍이든 무조건 알맹이 <p> 태그 텍스트 스트림을 직접 낚아챕니다.
-                    const shadowRoot = shadowHost.shadowRoot;
-                    const templateElem = shadowHost.querySelector('template');
-                    
-                    if (shadowRoot) {
-                        const paragraphs = Array.from(shadowRoot.querySelectorAll('p'));
-                        pureBodyText = paragraphs.map(p => p.textContent.trim()).filter(Boolean).join('\n\n');
-                    } else if (templateElem && templateElem.content) {
-                        const paragraphs = Array.from(templateElem.content.querySelectorAll('p'));
-                        pureBodyText = paragraphs.map(p => p.textContent.trim()).filter(Boolean).join('\n\n');
-                    } else {
-                        // 백업 파싱: 가상 문자열 버퍼에서 <p> 태그 알맹이만 직접 추출
-                        const innerHTML = shadowHost.innerHTML;
-                        const match = innerHTML.match(/<template[^>]*>([\s\S]*?)<\/template>/);
-                        const targetHtml = match ? match[1] : innerHTML;
-                        const virtualDoc = new DOMParser().parseFromString(targetHtml, 'text/html');
-                        const paragraphs = Array.from(virtualDoc.querySelectorAll('p'));
-                        pureBodyText = paragraphs.map(p => p.textContent.trim()).filter(Boolean).join('\n\n');
-                    }
+        // [우회 가이드 핵심] closed 장벽 문자열을 open으로 전면 강제 치환!
+        html = html.replace(/shadowrootmode=["']closed["']/gi, 'shadowrootmode="open"');
 
-                    // 본문 추출 검증 성공 시 팝업 정지 및 클로즈
-                    if (pureBodyText && pureBodyText.length > 50) {
-                        clearInterval(timer);
-                        
-                        // 에피소드 제목 추출
-                        let episodeTitle = 'Untitled Episode';
-                        const numElem = popupDoc.querySelector('.ne-h1, .ne-num, h1');
-                        if (numElem) {
-                            episodeTitle = numElem.textContent.trim();
-                        }
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(html, 'text/html');
+        
+        // 에피소드 제목 추출
+        let episodeTitle = 'Untitled Episode';
+        const numElem = doc.querySelector('.ne-num, .ne-title, h1, .ne-h1');
+        if (numElem) {
+            episodeTitle = numElem.textContent.trim();
+        }
 
-                        popup.close();
+        // 잠금이 강제로 해제된 섀도 돔 호스트 엘리먼트 조준
+        const shadowHost = doc.querySelector('.novel-viewer div[style*="font-size"]');
+        let cleanedContent = '';
 
-                        // 섀도 돔 노드 내부만 타겟팅했으므로 상하단 메뉴 찌꺼기가 원천 배제되어 자를 필요가 없습니다.
-                        pureBodyText = cleanText(pureBodyText);
-                        if (pureBodyText.startsWith(episodeTitle)) {
-                            pureBodyText = pureBodyText.slice(episodeTitle.length).trim();
-                        }
-
-                        resolve({
-                            episodeTitle: episodeTitle,
-                            content: pureBodyText
-                        });
-                    }
-                }
-            } catch (e) {
-                // 로딩 초기 순간 브라우저 예외 차단
+        if (shadowHost && shadowHost.shadowRoot) {
+            // 이제 open 상태가 되었으므로 shadowRoot 내부의 순수 소설 단락(<p>)들만 정밀 가공 수집 가능!
+            const paragraphs = Array.from(shadowHost.shadowRoot.querySelectorAll('p'));
+            cleanedContent = paragraphs.map(p => p.textContent.trim()).filter(Boolean).join('\n\n');
+        } else {
+            // Fallback: 혹시라도 섀도 돔 조립 전에 템플릿 태그가 남아있다면 직접 탐색 수집
+            const templateElem = doc.querySelector('.novel-viewer template');
+            if (templateElem && templateElem.content) {
+                const paragraphs = Array.from(templateElem.content.querySelectorAll('p'));
+                cleanedContent = paragraphs.map(p => p.textContent.trim()).filter(Boolean).join('\n\n');
             }
+        }
 
-            if (checkAttempts >= maxAttempts) {
-                clearInterval(timer);
-                console.error(`Timeout waiting for unlocked shadow DOM tree on: ${url}`);
-                try { popup.close(); } catch(_) {}
-                resolve(null);
-            }
-        }, 200);
-    });
+        // 유효 텍스트 길이 검증 방어코드
+        if (!cleanedContent || cleanedContent.length < 50) {
+            console.error(`Bypass parsed content is empty or too short on: ${url}`);
+            return null;
+        }
+
+        cleanedContent = cleanText(cleanedContent);
+        if (cleanedContent.startsWith(episodeTitle)) {
+            cleanedContent = cleanedContent.slice(episodeTitle.length).trim();
+        }
+
+        return {
+            episodeTitle: episodeTitle,
+            content: cleanedContent
+        };
+    } catch (e) {
+        console.error(`Error fetching novel content for ${url}:`, e);
+        return null;
+    }
 }
 
 function unescapeHTML(text) {
@@ -190,7 +174,7 @@ function createModal(title) {
     const progressBarContainer = document.createElement('div');
     Object.assign(progressBarContainer.style, { width: '100%', height: '8px', backgroundColor: '#eaecef', borderRadius: '8px', overflow: 'hidden' });
     
-    const progressBar = document.div = document.createElement('div');
+    const progressBar = document.createElement('div');
     Object.assign(progressBar.style, {
         width: '0%', height: '100%', background: 'linear-gradient(90deg, #3a7bd5, #6fa1ff)', borderRadius: '8px', transition: 'width 0.3s ease'
     });
@@ -236,6 +220,27 @@ function createProgressTracker(totalItems) {
             };
         }
     };
+}
+
+function formatTime(ms) {
+    if (ms < 1000) return "Please wait...";
+    if (ms < 60000) return `${Math.ceil(ms / 1000)}s`;
+    if (ms < 3600000) {
+        return `${Math.floor(ms / 60000)}m ${Math.floor((ms % 60000) / 1000)}s`;
+    }
+    return `${Math.floor(ms / 3600000)}h ${Math.floor((ms % 3600000) / 60000)}m`;
+}
+
+async function loadScript(url) {
+    return new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = url; script.onload = resolve; script.onerror = reject;
+        document.head.appendChild(script);
+    });
+}
+
+function sanitizeFilename(name) {
+    return name.replace(/[/\\?%*:|"<>]/g, '_');
 }
 
 async function downloadNovel(title, episodeLinks, startEpisode, endEpisode, delayMs = 5000) {
@@ -335,7 +340,7 @@ async function downloadNovel(title, episodeLinks, startEpisode, endEpisode, dela
             let result = await fetchNovelContent(episodeUrl);
             if (!result) {
                 captchaCount++;
-                const userConfirmed = confirm(`Bypass alert trigger! \n${episodeUrl}\nPlease make sure popups are allowed and click OK to retry.`);
+                const userConfirmed = confirm(`Bypass alert trigger! \n${episodeUrl}\nPlease make sure network is stable and click OK to retry.`);
                 if (!userConfirmed) { failedEpisodes++; continue; }
                 result = await fetchNovelContent(episodeUrl);
                 if (!result) { failedEpisodes++; continue; }
@@ -548,7 +553,7 @@ async function runCrawler() {
             const endEpisode = parseInt(endInput.input.value, 10);
             const delay = parseInt(delayInput.input.value, 10);
 
-            // [오타 수정 완료] IsNaN -> isNaN 교정으로 콘솔 에러 완벽 차단
+            // [오타 수정 완료] isNaN으로 철저히 보정하여 ReferenceError를 원천 차단했습니다.
             if (isNaN(startEpisode) || isNaN(endEpisode) || startEpisode < 1 || endEpisode < startEpisode || endEpisode > allEpisodeLinks.length) {
                 alert('Please enter a valid episode range.');
                 return;
