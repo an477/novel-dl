@@ -10,76 +10,75 @@ async function fetchNovelContent(url) {
     const parser = new DOMParser();
     const doc = parser.parseFromString(html, 'text/html');
     
-    // [처음 주신 코드 규칙 참조] 에피소드 제목 추출 기본값 정의
+    // Extract episode title
     let episodeTitle = 'Untitled Episode';
-    const numElem = doc.querySelector('.ne-num, .ne-title, h1');
+    const numElem = doc.querySelector('.ne-h1, .ne-num, h1');
     if (numElem) {
         episodeTitle = numElem.textContent.trim();
     }
 
     let cleanedContent = '';
 
-    // [핵심 변경 및 복원] Next.js 스트리밍 스크립트 블록 내에서 파편화된 본문 데이터 조립 파싱
+    // [우회 1순위] Next.js Hydration 스트리밍 데이터 구조 역추적 및 내부 데이터 파싱
     const scripts = Array.from(doc.querySelectorAll('script'));
-    let rawChunks = [];
-
     for (const script of scripts) {
         const text = script.textContent;
-        // Next.js 하이드레이션용 push 배열 매커니즘 추적
-        if (text.includes('__next_f') && text.includes('2화') || text.includes('화') || text.includes('마법')) {
-            // 정규식을 통해 유니코드 및 스트리밍 텍스트 파편들 추출
-            const matches = text.match(/"([^"]{100,})"/g);
-            if (matches) {
-                matches.forEach(m => {
+        // Next.js가 데이터를 클라이언트에 실어 보낼 때 사용하는 고유 데이터 스트림 규칙 파싱
+        if (text.includes('__next_f') && (text.includes('화') || text.includes('마법') || text.includes('투란'))) {
+            const stringMatches = text.match(/"([^"]{150,})"/g);
+            if (stringMatches) {
+                let longestChunk = '';
+                stringMatches.forEach(m => {
                     try {
-                        const unescaped = JSON.parse(m);
-                        if (unescaped && unescaped.length > 50 && !unescaped.includes('<html')) {
-                            rawChunks.push(unescaped);
+                        const parsed = JSON.parse(m);
+                        // HTML 태그가 아니면서 소설 본문 조건(긴 한글 문장)을 충족하는 문자열 선별
+                        if (parsed && parsed.length > longestChunk.length && !parsed.includes('<html')) {
+                            longestChunk = parsed;
                         }
                     } catch(_) {}
                 });
+                if (longestChunk) {
+                    cleanedContent = cleanText(longestChunk);
+                    if (cleanedContent.length > 100) break;
+                }
             }
         }
     }
 
-    // 추출된 파편들 중 소설 본문 조건에 맞는 긴 텍스트 선별 및 병합
-    if (rawChunks.length > 0) {
-        // 중복을 제거하고 가장 본문 데이터 형식을 띄는 긴 문자열 병합
-        const uniqueChunks = [...new Set(rawChunks)];
-        const mainContent = uniqueChunks.reduce((acc, curr) => curr.length > acc.length ? curr : acc, '');
-        if (mainContent) {
-            cleanedContent = cleanText(mainContent);
-        }
-    }
-
-    // 백업 파싱 구조: JSON 영역 탐색 (__NEXT_DATA__)
+    // [우회 2순위] API 통신용 숨겨진 데이터 토큰(data-token)을 가로채서 백업 조립
     if (!cleanedContent) {
-        const nextDataScript = doc.querySelector('#__NEXT_DATA__');
-        if (nextDataScript) {
+        const viewerElem = doc.querySelector('div[data-token]');
+        if (viewerElem) {
+            const token = viewerElem.getAttribute('data-token');
+            const novelId = viewerElem.getAttribute('novelId') || url.split('/')[4];
+            const episodeId = viewerElem.getAttribute('episodeId') || url.split('/')[5];
+            
             try {
-                const jsonData = JSON.parse(nextDataScript.textContent);
-                const pageProps = jsonData.props?.pageProps || {};
-                const rawContent = pageProps.episode?.content || pageProps.content || pageProps.story?.content;
-                if (typeof rawContent === 'string' && rawContent.length > 50) {
-                    cleanedContent = cleanText(rawContent);
+                // 사이트 내부에서 본문을 비동기로 호출하는 실제 API 주소를 다이렉트로 추적
+                const apiRes = await fetch(`/api/novel/viewer?novelId=${novelId}&episodeId=${episodeId}&token=${encodeURIComponent(token)}`);
+                if (apiRes.ok) {
+                    const apiData = await apiRes.json();
+                    if (apiData && apiData.content) {
+                        cleanedContent = cleanText(apiData.content);
+                    }
                 }
             } catch (e) {
-                console.error("Failed to parse __NEXT_DATA__ JSON", e);
+                console.error("API backend tracking failed:", e);
             }
         }
     }
 
-    // [처음 주신 코드 로직 복원] 최후의 수단으로 DOM 타겟 엘리먼트 내부 HTML 파싱 시도
+    // 최후의 방어코드: 일반 DOM 객체 내부 파싱 시도
     if (!cleanedContent) {
-        const contentContainer = doc.querySelector('.novel-story, .view-content, article, #novel_content, .nd-desc-wrap');
+        const contentContainer = doc.querySelector('.novel-viewer, article, .view-content, #novel_content');
         if (contentContainer) {
             cleanedContent = cleanText(contentContainer.innerHTML);
         }
     }
 
-    // "불러오는 중" 상태의 뼈대만 잡혔거나 본문이 완전히 비어있다면 에러 차단 리턴
-    if (!cleanedContent || cleanedContent.includes("불러오는 중")) {
-        console.error(`Failed to find real dynamic novel content on the page: ${url}`);
+    // 완전히 빈 껍데기 로딩 안내문만 긁어온 경우는 에러로 간주하여 처리 차단
+    if (!cleanedContent || cleanedContent.includes("불러오는 중") || cleanedContent.length < 50) {
+        console.error(`Failed to bypass protections or find content on: ${url}`);
         return null;
     }
 
@@ -93,32 +92,19 @@ async function fetchNovelContent(url) {
     };
 }
 
-// [처음 주신 코드 그대로 완전 복원] HTML 이스케이프 문자 매핑 테이블 및 복원 기능
 function unescapeHTML(text) {
     const entities = {
-        '&lt;': '<',
-        '&gt;': '>',
-        '&amp;': '&',
-        '&quot;': '"',
-        '&apos;': "'",
-        '&nbsp;': ' ',
-        '&ndash;': '-',
-        '&mdash;': '--',
-        '&lsquo;': "'",
-        '&rsquo;': "'",
-        '&ldquo;': '"',
-        '&rdquo;': '"'
+        '&lt;': '<', '&gt;': '>', '&amp;': '&', '&quot;': '"', '&apos;': "'",
+        '&nbsp;': ' ', '&ndash;': '-', '&mdash;': '--', '&lsquo;': "'",
+        '&rsquo;': "'", '&ldquo;': '"', '&rdquo;': '"'
     };
-
     Object.entries(entities).forEach(([entity, replacement]) => {
         const regex = new RegExp(entity, 'g');
         text = text.replace(regex, replacement);
     });
-
     return text;
 }
 
-// [처음 주신 코드 그대로 완전 복원] 텍스트 가공 및 공백 정문화 기능
 function cleanText(text) {
     text = text.replace(/<div>/g, '');
     text = text.replace(/<\/div>/g, '');
@@ -140,7 +126,6 @@ function cleanText(text) {
     return text;
 }
 
-// [처음 주신 코드 가공] UI 모달 생성 함수 (영어 텍스트 반영)
 function createModal(title) {
     if (!document.getElementById('novel-dl-styles')) {
         const style = document.createElement('style');
@@ -225,7 +210,6 @@ function createModal(title) {
     return { modal, statusElement, progressText, timeRemaining, progressBar, detailedProgress };
 }
 
-// [처음 주신 코드 그대로 완전 복원] 이동 평균(Moving Average) 기반 실시간 시간 측정 분석 엔진
 function createProgressTracker(totalItems) {
     const startTime = Date.now();
     const processingTimes = [];
@@ -280,7 +264,6 @@ function sanitizeFilename(name) {
     return name.replace(/[/\\?%*:|"<>]/g, '_');
 }
 
-// [처음 주신 코드 가공] 소설 메인 다운로드 프로세스 핸들러 (영문화 완료)
 async function downloadNovel(title, episodeLinks, startEpisode, endEpisode, delayMs = 5000) {
     const dialog = document.createElement('div');
     Object.assign(dialog.style, {
@@ -378,7 +361,7 @@ async function downloadNovel(title, episodeLinks, startEpisode, endEpisode, dela
             let result = await fetchNovelContent(episodeUrl);
             if (!result) {
                 captchaCount++;
-                const userConfirmed = confirm(`CAPTCHA detected! \n${episodeUrl}\nPlease solve it and click OK.`);
+                const userConfirmed = confirm(`Bypass alert or CAPTCHA trigger! \n${episodeUrl}\nPlease make sure the tab is active, wait a moment, and click OK.`);
                 if (!userConfirmed) { failedEpisodes++; continue; }
                 result = await fetchNovelContent(episodeUrl);
                 if (!result) { failedEpisodes++; continue; }
@@ -431,7 +414,6 @@ async function downloadNovel(title, episodeLinks, startEpisode, endEpisode, dela
     }
 }
 
-// [핵심 변경] 뉴토끼 마크업 구조 매핑 타이틀 수집기
 function extractTitle() {
     const titleElement = document.querySelector('.novel-detail h1');
     if (titleElement) {
@@ -443,22 +425,12 @@ function extractTitle() {
     return null;
 }
 
-// [핵심 변경] 뉴토끼 구조에 호환되는 정순 배열 가공 수집기
 function extractEpisodeLinks() {
     const links = document.querySelectorAll('.novel-eps li a');
     const episodeLinks = Array.from(links).map(link => link.getAttribute('href')).filter(Boolean);
     return episodeLinks.reverse();
 }
 
-async function fetchPage(url) {
-    const response = await fetch(url);
-    if (!response.ok) return null;
-    const html = await response.text();
-    const parser = new DOMParser();
-    return parser.parseFromString(html, 'text/html');
-}
-
-// [제약 조건 완화] Next.js 동적 도메인 및 번호 경로 유연 검사 적용
 async function runCrawler() {
     if (!window.location.pathname.includes('/novel/')) {
         alert('This script must be executed on the novel listing page.');
